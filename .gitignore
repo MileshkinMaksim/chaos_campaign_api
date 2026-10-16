@@ -1,0 +1,16 @@
+# Python files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.pyc
+.pytest_cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Virtual environments
+.venv
+.env
