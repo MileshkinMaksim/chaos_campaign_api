@@ -1,6 +1,6 @@
 import uuid
 from typing import Optional
-from sqlalchemy import Boolean, ForeignKey, Integer, String
+from sqlalchemy import String, Integer, Boolean, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.database import Base
 
@@ -13,8 +13,11 @@ class PilotModel(Base):
     name: Mapped[str] = mapped_column(String(100), nullable=False)
     gunnery: Mapped[int] = mapped_column(Integer, default=4)
     piloting: Mapped[int] = mapped_column(Integer, default=5)
-    experience_points: Mapped[int] = mapped_column(Integer, default=0)
-    total_xp_earned: Mapped[int] = mapped_column(Integer, default=0)
+    
+    # Стартовый запас опыта у пилотов — 150 XP
+    experience_points: Mapped[int] = mapped_column(Integer, default=150)
+    total_xp_earned: Mapped[int] = mapped_column(Integer, default=150)
+    
     edge_points: Mapped[int] = mapped_column(Integer, default=1)
     is_temporary_hire: Mapped[bool] = mapped_column(Boolean, default=False)
 

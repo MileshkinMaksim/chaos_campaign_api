@@ -9,31 +9,35 @@ class ChaosCampaignException(Exception):
         self.code = code
 
 
-class InsufficientXPError(ChaosCampaignException):
-    """Исключение при нехватке очков опыта (XP) у пилота."""
+class InsufficientSupportPointsError(Exception):
+    """Исключение при нехватке Support Points (SP)."""
     def __init__(self, required: int, available: int):
-        super().__init__(
-            message=f"Недостаточно опыта (XP). Требуется: {required}, доступно: {available}",
-            code="INSUFFICIENT_XP"
-        )
+        self.required = required
+        self.available = available
+        self.message = f"Недостаточно SP: требуется {required}, доступно {available}"
+        super().__init__(self.message)
 
+class InvalidStartingForceConfigError(Exception):
+    """Исключение при нарушении правил создания стартового отряда."""
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(self.message)
 
-class ReputationRequirementNotMetError(ChaosCampaignException):
-    """Исключение при несоответствии репутации отряда требованиям контракта."""
+class InsufficientXPError(Exception):
+    """Исключение при нехватке XP у пилота."""
     def __init__(self, required: int, available: int):
-        super().__init__(
-            message=f"Недостаточно Репутации для согласования условий. Требуется: {required}, текущая: {available}",
-            code="REPUTATION_REQUIREMENT_NOT_MET"
-        )
+        self.required = required
+        self.available = available
+        self.message = f"Недостаточно XP: требуется {required}, доступно {available}"
+        super().__init__(self.message)
 
-
-class InsufficientWarchestPointsError(ChaosCampaignException):
-    """Исключение при нехватке очков Warchest Points (WP)."""
-    def __init__(self, required: int, available: int):
-        super().__init__(
-            message=f"Недостаточно очков Warchest (WP). Требуется: {required}, доступно: {available}",
-            code="INSUFFICIENT_WARCHEST_POINTS"
-        )
+class ReputationRequirementNotMetError(Exception):
+    """Исключение при недостаточной репутации для контракта."""
+    def __init__(self, required: int, current: int):
+        self.required = required
+        self.current = current
+        self.message = f"Недостаточный уровень репутации: требуется {required}, текущая {current}"
+        super().__init__(self.message)
 
 
 async def chaos_campaign_exception_handler(request: Request, exc: ChaosCampaignException) -> JSONResponse:

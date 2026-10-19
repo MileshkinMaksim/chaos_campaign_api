@@ -1,9 +1,8 @@
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import settings
-from app.db.models.pilot import PilotModel
+from app.db.models.force import ForceModel
 
 
 async def test_upgrade_pilot_gunnery_success(
@@ -14,6 +13,10 @@ async def test_upgrade_pilot_gunnery_success(
 ):
     """Тест успешного улучшения Gunnery с 4 до 3 за 300 XP."""
     pilot = test_force.pilots[0]
+    pilot.experience_points = 500  # Добавляем достаточное количество XP (требуется 300 XP)
+    test_db.add(pilot)
+    await test_db.flush()
+
     initial_xp = pilot.experience_points
 
     response = await client.post(
@@ -36,7 +39,7 @@ async def test_upgrade_pilot_insufficient_xp(
 ):
     """Тест ошибки 400 Bad Request при нехватке XP у пилота."""
     pilot = test_force.pilots[0]
-    pilot.experience_points = 50  # Устанавливаем заведомо малое количество XP (нужно 300)
+    pilot.experience_points = 50  # Устанавливаем заведомо малое значение
     test_db.add(pilot)
     await test_db.flush()
 

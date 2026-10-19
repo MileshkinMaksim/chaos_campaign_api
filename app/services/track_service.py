@@ -1,31 +1,19 @@
 from typing import List
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.core.exceptions import InsufficientWarchestPointsError
+from app.core.exceptions import InsufficientSupportPointsError
 from app.db.models.force import ForceModel, MechUnitModel
 from app.db.models.pilot import PilotModel
 from app.schemas.force import UnitStatus
-from app.schemas.track import (
-    TrackCompletionRequest,
-    TrackCompletionResponse,
-    XPAllocationResult,
-)
+from app.schemas.track import TrackCompletionRequest, TrackCompletionResponse, XPAllocationResult
 
 
 class TrackService:
     @staticmethod
-    async def start_track(
-        db: AsyncSession, 
-        force: ForceModel, 
-        entry_cost_wp: int
-    ) -> ForceModel:
-        """Списывает стоимость входа в миссию (Warchest Entry Cost)."""
-        if force.warchest_points < entry_cost_wp:
-            raise InsufficientWarchestPointsError(
-                required=entry_cost_wp, 
-                available=force.warchest_points
-            )
-        force.warchest_points -= entry_cost_wp
+    async def start_track(db: AsyncSession, force: ForceModel, entry_cost_sp: int) -> ForceModel:
+        if force.support_points < entry_cost_sp:
+            raise InsufficientSupportPointsError(required=entry_cost_sp, available=force.support_points)
+        force.support_points -= entry_cost_sp
         db.add(force)
         await db.flush()
         return force
@@ -35,20 +23,15 @@ class TrackService:
         db: AsyncSession,
         force: ForceModel,
         track_id: str,
-        earned_wp: int,
         earned_sp: int,
         request: TrackCompletionRequest
     ) -> TrackCompletionResponse:
-        """Транзакционная фиксация итогов миссии и попилотная конвертация SP -> XP."""
-        # 1. Расчет конвертации SP в XP
         total_sp_spent = sum(p.sp_allocated_to_xp for p in request.pilot_performances)
+        net_sp = earned_sp - total_sp_spent
         
-        # Зачисление сетевого прироста ресурсов
-        force.warchest_points += earned_wp
-        force.support_points += (earned_sp - total_sp_spent)
+        force.support_points += net_sp
         db.add(force)
 
-        # 2. Начисление XP пилотам
         xp_results: List[XPAllocationResult] = []
         for perf in request.pilot_performances:
             pilot_stmt = select(PilotModel).where(PilotModel.id == perf.pilot_id)
@@ -75,7 +58,6 @@ class TrackService:
                     )
                 )
 
-        # 3. Фиксация повреждений техники
         if request.damaged_unit_ids:
             await TrackService._update_units_status(db, request.damaged_unit_ids, UnitStatus.DAMAGED)
         if request.destroyed_unit_ids:
@@ -87,11 +69,11 @@ class TrackService:
 
         return TrackCompletionResponse(
             track_id=track_id,
-            wp_earned=earned_wp,
             sp_earned=earned_sp,
             total_sp_spent_on_xp=total_sp_spent,
+            net_sp_gained=net_sp,
             xp_allocations=xp_results,
-            summary=f"Трек '{track_id}' завершен. Заработано: {earned_wp} WP, {earned_sp} SP. Списано на XP: {total_sp_spent} SP."
+            summary=f"Трек '{track_id}' завершен. Заработано: {earned_sp} SP. Списано на XP: {total_sp_spent} SP. Чистый прирост: {net_sp} SP."
         )
 
     @staticmethod
