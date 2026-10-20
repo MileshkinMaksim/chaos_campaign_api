@@ -73,3 +73,30 @@ class ForceService:
         return result.scalar_one()
 
     create_starting_force = create_force
+
+    @classmethod
+    async def assign_pilot_to_unit(
+        cls, db: AsyncSession, force: ForceModel, unit_id: str, pilot_id: str | None
+    ) -> ForceModel:
+        """Назначает или снимает пилота с техники."""
+        unit = next((u for u in force.units if u.id == unit_id), None)
+        if not unit:
+            raise ValueError("Техника не найдена в составе этого отряда")
+
+        if pilot_id:
+            pilot = next((p for p in force.pilots if p.id == pilot_id), None)
+            if not pilot:
+                raise ValueError("Пилот не найден в составе этого отряда")
+            unit.assigned_pilot_id = pilot.id
+        else:
+            unit.assigned_pilot_id = None
+
+        await db.commit()
+        await db.refresh(force)
+        return force
+
+    @classmethod
+    async def delete_force(cls, db: AsyncSession, force: ForceModel) -> None:
+        """Каскадно удаляет отряд и все связанные записи (юниты, пилоты)."""
+        await db.delete(force)
+        await db.commit()

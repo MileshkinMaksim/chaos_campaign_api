@@ -17,5 +17,5 @@ class UserModel(Base):
     forces: Mapped[List["ForceModel"]] = relationship(
         "ForceModel", 
         back_populates="owner", 
-        cascade="all, delete-orphan"
+        cascade="all, delete"
     )
