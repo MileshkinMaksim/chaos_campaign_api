@@ -20,9 +20,20 @@ class ForceModel(Base):
     # Стартовая репутация отряда — значение 1
     reputation_score: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
-    owner: Mapped["UserModel"] = relationship("UserModel", back_populates="forces")
-    units: Mapped[List["MechUnitModel"]] = relationship("MechUnitModel", back_populates="force", cascade="all, delete-orphan")
-    pilots: Mapped[List["PilotModel"]] = relationship("PilotModel", back_populates="force", cascade="all, delete-orphan")
+    owner: Mapped["UserModel"] = relationship(
+        "UserModel", 
+        back_populates="forces"
+        )
+    units: Mapped[List["MechUnitModel"]] = relationship(
+        "MechUnitModel", 
+        back_populates="force", 
+        cascade="all, delete-orphan"
+        )
+    pilots: Mapped[List["PilotModel"]] = relationship(
+        "PilotModel", 
+        back_populates="force", 
+        cascade="all, delete-orphan"
+        )
 
 
 class MechUnitModel(Base):
@@ -38,4 +49,7 @@ class MechUnitModel(Base):
     status: Mapped[UnitStatus] = mapped_column(SQLEnum(UnitStatus), default=UnitStatus.OPERATIONAL)
     assigned_pilot_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("pilots.id", ondelete="SET NULL"), nullable=True)
 
-    force: Mapped[Optional["ForceModel"]] = relationship("ForceModel", back_populates="units")
+    force: Mapped[Optional["ForceModel"]] = relationship(
+        "ForceModel", 
+        back_populates="units"
+        )

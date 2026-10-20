@@ -24,5 +24,5 @@ export const forcesApi = {
   deleteForce: (forceId: string) =>
     apiClient.delete(`/forces/${forceId}`).then(r => r.data),
   exportRecordSheet: (forceId: string) =>
-    apiClient.get<Blob>(`/forces/${forceId}/export`, { responseType: 'blob' }).then(r => r.data), // <-- Добавлен .then(r => r.data)
+    apiClient.get(`/forces/${forceId}/export`, { responseType: 'blob' }).then(r => r.data),
 };

@@ -43,18 +43,29 @@ export const DashboardPage: React.FC = () => {
   const handleExportSheet = async () => {
   if (!id || !force) return;
   try {
-    const blobData = await forcesApi.exportRecordSheet(id);
-    // blobData уже является объектом Blob
-    const blob = blobData instanceof Blob ? blobData : new Blob([JSON.stringify(blobData)], { type: 'application/json' });
+    const rawData = await forcesApi.exportRecordSheet(id);
     
+    let blob: Blob;
+    if (rawData instanceof Blob) {
+      blob = rawData;
+    } else if (rawData && (rawData as any).data instanceof Blob) {
+      blob = (rawData as any).data;
+    } else {
+      blob = new Blob([JSON.stringify(rawData)], { type: 'application/json' });
+    }
+
     const url = window.URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
     link.setAttribute('download', `${force.name}_record_sheet.json`);
     document.body.appendChild(link);
     link.click();
-    link.remove();
-    window.URL.revokeObjectURL(url);
+    document.body.removeChild(link);
+
+    // Даем браузеру время зарегистрировать событие скачивания
+    setTimeout(() => {
+      window.URL.revokeObjectURL(url);
+    }, 1000);
   } catch (err) {
     console.error('Ошибка при экспорте Record Sheet', err);
   }

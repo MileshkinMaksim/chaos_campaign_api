@@ -127,6 +127,15 @@ async def get_force(
     """Возвращает полную структуру отряда с подгруженными списками техники и пилотов."""
     return force
 
+@router.delete("/{force_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Удаление отряда")
+async def delete_force(
+    force_id: str = Path(..., min_length=3),
+    force: ForceModel = Depends(verify_force_ownership),
+    db: AsyncSession = Depends(get_db)
+):
+    """Каскадно удаляет отряд пользователя со всей связанной техникой и пилотами."""
+    await ForceService.delete_force(db=db, force=force)
+    return None
 
 @router.post("/{force_id}/assign-pilot", response_model=ForceResponse, summary="Назначение пилота на мех")
 async def assign_pilot(
@@ -142,18 +151,6 @@ async def assign_pilot(
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-
-@router.get("/{force_id}/export", summary="Экспорт Mercenary Force Record Sheet")
-@router.delete("/{force_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Удаление отряда")
-async def delete_force(
-    force_id: str = Path(..., min_length=3),
-    force: ForceModel = Depends(verify_force_ownership),
-    db: AsyncSession = Depends(get_db)
-):
-    """Каскадно удаляет отряд пользователя со всей связанной техникой и пилотами."""
-    await ForceService.delete_force(db=db, force=force)
-    return None
 
 
 @router.get("/{force_id}/export", summary="Экспорт Mercenary Force Record Sheet")

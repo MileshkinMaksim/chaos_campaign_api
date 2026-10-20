@@ -58,7 +58,7 @@ class ForceService:
             )
             db.add(unit)
 
-        await db.flush()
+        await db.commit()
 
         # 4. Запрос с eager loading связей для безопасной сериализации Pydantic
         stmt = (
