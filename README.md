@@ -1,71 +1,30 @@
-# ⚔️ Chaos Campaign Manager (Draconis Reach)
+# Chaos Campaign Manager (Draconis Reach)
 
-**Chaos Campaign Manager** — это веб-сервис и REST API для автоматизации ведения наемнических отрядов в настольной стратегической игре **BattleTech Classic** (по правилам *Hot Spots: Draconis Reach* и системе *Chaos Campaign: Mercenaries*).
+**Chaos Campaign Manager** — это веб-сервис и REST API для автоматизации ведения расчетов кампаний в настольной игре **Classic BattleTech** (по правилам *Hot Spots: Draconis Reach* и системе *Chaos Campaign: Mercenaries*).
 
-Сервис берет на себя всю рутину командира: отслеживание состояния боевой техники и пилотов, учет финансово-материальных ресурсов, проведение контрактов, ремонт и утилизацию лома.
-
----
-
-## 🚀 Основные возможности
-
-* **Архитектура Command Hub (Multi-Force):** Возможность владеть и одновременно управлять несколькими наемническими отрядами в одном аккаунте ($1 \rightarrow N$).
-
-
-* **Единая экономика Support Points (SP):** Унифицированная финансовая система — покупка и ремонт мехов, вступительные взносы за миссии, оплата контрактов и конвертация в XP рассчитываются строго в SP.
-
-
-* **Прокачка и управление пилотами:** Нелинейный расчет стоимости улучшения навыков (Gunnery/Piloting), Edge и специальных способностей (SPA).
-
-
-* **Контракты и переговоры:** Генерация контрактов с учетом репутации отряда, гибкие условия выплат и командных прав.
-
-
-* **Проведение миссий (Tracks):** Ввод итогов боя, отслеживание потерь/повреждений, распределение XP и наград, а также скрап уничтоженных мехов (возврат 25% стоимости в SP).
-
-
-* **Логистика и RAT:** Генерация случайного состава техники по таблицам назначения (*Random Assignment Tables — RAT*) выбранной фракции и ремонтный док.
-
-
-* **Экспорт документов:** Скачивание официальных листов отряда (*Mercenary Force Record Sheet*) в формате JSON.
-
-
+Сервис полностью избавляет от необходимости вручную заполнять бумажные бланки и вести учет в электронных таблицах. Он автоматизирует отслеживание состояния боевой техники и пилотов, учет финансово-материальных ресурсов, проведение контрактов, ремонт, утилизацию и покупку мехов.
 
 ---
 
 ## 🛠 Технологический стек
 
 ### Backend
-
 * **Python 3.11+** / **FastAPI**
-
-* **SQLAlchemy 2.0 (Async)** + `asyncpg` / `aiosqlite`
-
-* **Pydantic v2** (DTO с валидацией стартового состава и BV2)
-
-
-* **Alembic** (управление миграциями БД)
-
-
-* **OAuth2 + JWT** (аутентификация пользователей)
-
-
+* **PostgreSQL 16** (Production/Docker) + `asyncpg` / **SQLite** (`aiosqlite` в Dev/Test)
+* **SQLAlchemy 2.0 (Async)** + **Alembic** (асинхронный ORM и миграции схемы БД)
+* **Pydantic v2** (DTO-схемы с кастомной валидацией $BV2 \le 3000$ и лимитов)
+* **OAuth2 + JWT** (`PyJWT`, `passlib[bcrypt]`)
 * **uv** (высокопроизводительный менеджер пакетов Python)
 
-
-
 ### Frontend
-
 * **React 18** + **Vite**
-
 * **TypeScript 5.0+**
-
-* **TanStack Query v5 (React Query)** + **Zustand 4**
-
+* **Zustand 4** (глобальное состояние авторизации и отрядов) + **TanStack Query v5** (серверный кэш)
 * **Tailwind CSS** + **Radix UI / Shadcn UI**
+* **Axios** (с авторизационным Interceptor и префиксом API `/api/v1`)
 
-* **Axios** (с JWT Interceptor)
-
-
+### Инфраструктура
+* **Docker** & **Docker Compose** (многоконтейнерное развертывание: Database + Backend + Frontend/Nginx)
 
 ---
 
@@ -73,61 +32,89 @@
 
 ```text
 chaos_campaign_api/
-├── app/                      # FastAPI Backend приложение[cite: 3, 5]
-│   ├── api/v1/               # REST API роутеры (auth, forces, pilots, contracts, tracks, logistics)[cite: 1, 3]
-│   ├── core/                 # Безопасность, исключения и логирование[cite: 1, 3]
-│   ├── db/                   # Модели SQLAlchemy, сессии и JSON-справочники RAT[cite: 1, 3]
-│   ├── schemas/              # Pydantic v2 DTO модели[cite: 1, 3]
-│   └── services/             # Бизнес-логика правил BattleTech[cite: 1, 3]
-├── frontend/                 # React + TypeScript SPA приложение[cite: 2, 5]
-├── alembic/                  # Миграции структуры базы данных[cite: 1, 3]
-├── docs/                     # Технические спецификации[cite: 5]
-└── pyproject.toml            # Конфигурация проекта и зависимостей[cite: 1, 3, 5]
-
+├── app/                        # Backend приложения на FastAPI
+│   ├── api/v1/                 # REST API маршруты (auth, forces, pilots, contracts, tracks, logistics)
+│   ├── core/                   # JWT, хеширование паролей, логирование и кастомные исключения
+│   ├── db/                     # ORM-модели SQLAlchemy, подключение к СУБД и seed-данные RAT
+│   │   ├── data/factions_rat.json # Динамический JSON справочник фракций и RAT
+│   │   └── models/             # Модели UserModel, ForceModel, PilotModel, MechUnitModel и др.
+│   ├── schemas/                # Pydantic v2 DTO модели валидации
+│   ├── services/               # Бизнес-логика (калькулятор XP, переговоры, логистика, треки)
+│   ├── config.py               # Конфигурация приложения (Pydantic Settings)
+│   └── main.py                 # Точка входа: FastAPI app, lifespan, CORS и обработчики ошибок
+├── frontend/                   # Frontend SPA приложение на React
+│   ├── src/
+│   │   ├── api/                # Axios-клиент c JWT interceptor и сервисы вызов API
+│   │   ├── components/         # Radix / Shadcn UI компоненты (отряды, пилоты, логистика)
+│   │   ├── pages/              # Страницы (Auth, Command Hub, Dashboard, Logistics, Hub)
+│   │   ├── store/              # Состояние Zustand (authStore, forceStore)
+│   │   └── types/              # TypeScript интерфейсы и DTO-типы
+│   ├── nginx.conf              # Nginx конфигурация для Docker frontend
+│   └── Dockerfile              # Сборка фронтенда в Nginx контейнере
+├── alembic/                    # Скрипты и истории миграций СУБД
+├── docs/                       # Паспорта проекта, архитектуры и спецификации
+├── docker-compose.yml          # Многоконтейнерный запуск (PostgreSQL + FastAPI + Frontend)
+├── Dockerfile                  # Dockerfile бэкенда
+└── pyproject.toml              # Управление зависимостями Python (uv)
 ```
 
 ---
 
 ## 💻 Быстрый запуск
 
-### 1. Клонирование репозитория
+### Вариант 1. Запуск через Docker Compose (Рекомендуемый)
+
+Для полного запуска всей инфраструктуры (СУБД PostgreSQL 16, бэкенд FastAPI и фронтенд Nginx) одной командой:
 
 ```bash
+# Клонирование репозитория
 git clone https://github.com/MileshkinMaksim/chaos_campaign_api.git
 cd chaos_campaign_api
 
+# Запуск в фоновом режиме со сборкой контейнеров
+docker compose up -d --build
 ```
 
-### 2. Запуск Backend (FastAPI)
+При старте контейнер FastAPI автоматически создаст необходимые таблицы в PostgreSQL через `lifespan` и загрузит справочники из `factions_rat.json`.
 
-Проект использует менеджер пакетов `uv`:
+* **Веб-интерфейс (Frontend):** `http://localhost` (порт 80)
+* **Swagger UI (Backend API):** `http://localhost:8000/docs`
+
+Для остановки контейнеров:
+```bash
+docker compose down
+```
+
+---
+
+### Вариант 2. Локальная разработка (Без Docker)
+
+#### 1. Запуск Backend (FastAPI + SQLite/aiosqlite)
 
 ```bash
-# Установка зависимостей
+# Установка зависимостей с помощью uv
 uv sync
 
-# Применение миграций базы данных
+# Применение миграций базы данных Alembic
 uv run alembic upgrade head
 
-# Запуск веб-сервера разработки
+# Запуск dev-сервера Uvicorn
 uv run uvicorn app.main:app --reload
-
 ```
 
 * **API доступен по адресу:** `http://localhost:8000`
-* **Swagger UI документация:** `http://localhost:8000/docs`
+* **Интерактивная документация:** `http://localhost:8000/docs`
 
-### 3. Запуск Frontend (React)
+#### 2. Запуск Frontend (React + Vite)
 
 ```bash
 cd frontend
 
-# Установка зависимостей
+# Установка зависимостей Node.js
 npm install
 
-# Запуск dev-сервера Vite
+# Запуск сервера разработки Vite
 npm run dev
-
 ```
 
 * **Интерфейс доступен по адресу:** `http://localhost:5173`
@@ -138,33 +125,22 @@ npm run dev
 
 | Раздел | Эндпоинт | Метод | Описание |
 | --- | --- | --- | --- |
-| **Auth** | `/api/v1/auth/register` | `POST` | Регистрация нового командира
-
- |
-| **Auth** | `/api/v1/auth/token` | `POST` | Авторизация и получение JWT-токена
-
- |
-| **Forces** | `/api/v1/forces/me` | `GET` | Получение списка всех отрядов пользователя
-
- |
-| **Forces** | `/api/v1/forces/` | `POST` | Создание нового отряда наемников
-
- |
-| **Forces** | `/api/v1/forces/{id}` | `DELETE` | Каскадное удаление (расформирование) отряда
-
- |
-| **Pilots** | `/api/v1/pilots/{id}/upgrade` | `POST` | Прокачка навыков и очков пилота за XP
-
- |
-| **Contracts** | `/api/v1/contracts/available` | `GET` | Поиск доступных контрактов
-
- |
-| **Tracks** | `/api/v1/tracks/{id}/complete` | `POST` | Завершение миссии, расчет наград и конвертация SP $\rightarrow$ XP
-
- |
-| **Logistics** | `/api/v1/logistics/repair` | `POST` | Ремонт поврежденной техники за SP
-
- |
+| **Auth** | `/api/v1/auth/register` | `POST` | Регистрация нового командира |
+| **Auth** | `/api/v1/auth/token` | `POST` | Авторизация и получение JWT-токена |
+| **Forces** | `/api/v1/forces/starting-options` | `GET` | Получение списка доступных фракций и стартовых RAT из JSON |
+| **Forces** | `/api/v1/forces/me` | `GET` | Получение всех отрядов текущего пользователя |
+| **Forces** | `/api/v1/forces/` | `POST` | Создание нового отряда с валидацией состава |
+| **Forces** | `/api/v1/forces/{id}` | `DELETE` | Каскадное расформирование отряда со всеми пилотами и мехами |
+| **Forces** | `/api/v1/forces/{id}/export` | `GET` | Экспорт листа отряда (*Record Sheet*) в формате JSON |
+| **Forces** | `/api/v1/forces/{id}/assign-pilot` | `POST` | Привязка или отвязка пилота от меха |
+| **Pilots** | `/api/v1/pilots/{id}/upgrade` | `POST` | Улучшение навыков (*Gunnery/Piloting*), *Edge* или *SPA* за XP |
+| **Contracts** | `/api/v1/contracts/available` | `GET` | Поиск и фильтрация доступных контрактов |
+| **Contracts** | `/api/v1/contracts/{id}/negotiate` | `POST` | Изменение условий контракта с учетом репутации |
+| **Tracks** | `/api/v1/tracks/{id}/complete` | `POST` | Фиксация итогов боя, изменение статуса мехов, начисление SP и XP |
+| **Logistics** | `/api/v1/logistics/repair` | `POST` | Ремонт поврежденной техники за SP |
+| **Logistics** | `/api/v1/logistics/rat-roll` | `GET` | Генерация случайной техники по таблицам RAT выбранной фракции |
+| **Logistics** | `/api/v1/logistics/buy-unit` | `POST` | Покупка выбранного меха за SP |
+| **Logistics** | `/api/v1/logistics/scrap` | `POST` | Списание/утилизация техники с возвратом доли стоимости в SP |
 
 ---
 
