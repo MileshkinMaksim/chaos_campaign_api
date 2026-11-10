@@ -157,6 +157,808 @@ repomix-output.xml
 
 # Files
 
+## File: app/api/v1/endpoints/__init__.py
+````python
+
+````
+
+## File: app/api/v1/endpoints/contracts.py
+````python
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.database import get_db
+from app.db.models.force import ForceModel
+from app.db.models.user import UserModel
+from app.dependencies.auth import get_current_user
+from app.dependencies.campaign import verify_force_ownership
+from app.schemas.contract import ContractNegotiationOffer, ContractResponse
+from app.schemas.force import Faction
+from app.services.generator_service import GeneratorService
+from app.services.negotiation_engine import NegotiationEngine
+
+router = APIRouter()
+
+
+@router.get("/available", response_model=List[ContractResponse], summary="Поиск доступных контрактов")
+async def get_available_contracts(
+    employer: Optional[Faction] = Query(None, description="Фильтр по нанимателю"),
+    location: Optional[str] = Query(None, min_length=2, description="Локация Hot Spot"),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=50),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Возвращает список доступных контрактов с поддержкой фильтрации и пагинации."""
+    # Генерация примеров контрактов для каталога
+    contracts = [
+        GeneratorService.generate_random_contract(
+            employer=employer or Faction.DRACONIS_COMBINE,
+            target_faction=Faction.FEDERATED_SUNS
+        ) for _ in range(limit)
+    ]
+    return contracts
+
+
+@router.post("/{contract_id}/negotiate", summary="Переговоры по условиям контракта")
+async def negotiate_contract(
+    contract_id: str,
+    offer: ContractNegotiationOffer,
+    force_id: str = Query(..., description="ID отряда"),
+    force: ForceModel = Depends(verify_force_ownership)
+):
+    """
+    Проверяет запрашиваемые условия контракта с Очками Репутации отряда.
+    
+    * **400 Bad Request**: Недостаточно репутации (`ReputationRequirementNotMetError`).
+    """
+    mock_contract = GeneratorService.generate_random_contract()
+    mock_contract.id = contract_id
+
+    NegotiationEngine.validate_negotiation_offer(
+        force=force, contract=mock_contract, requested_terms=offer.requested_terms
+    )
+    mock_contract.terms = offer.requested_terms
+    return {"status": "terms_accepted", "contract": mock_contract}
+
+
+@router.post("/{contract_id}/sign", summary="Подписание контракта")
+async def sign_contract(
+    contract_id: str,
+    force_id: str = Query(...),
+    force: ForceModel = Depends(verify_force_ownership)
+):
+    """Подписывает контракт и закрепляет его за отрядом."""
+    return {"status": "contract_signed", "contract_id": contract_id, "force_id": force.id}
+````
+
+## File: app/api/v1/endpoints/generator.py
+````python
+from fastapi import APIRouter, Depends
+from app.schemas.contract import ContractResponse
+from app.schemas.generator import ContractGenerateRequest
+from app.services.generator_service import GeneratorService
+
+router = APIRouter()
+
+
+@router.post("/contract", response_model=ContractResponse, summary="Процедурная генерация контракта")
+async def generate_contract(request: ContractGenerateRequest):
+    """Создает случайный контракт по правилам книги Hot Spots."""
+    return GeneratorService.generate_random_contract(
+        employer=request.employer,
+        target_faction=request.target_faction
+    )
+````
+
+## File: app/api/v1/endpoints/logistics.py
+````python
+import random
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.database import get_db
+from app.db.models.force import ForceModel
+from app.dependencies.campaign import verify_force_ownership
+from app.schemas.force import Faction, WeightClass
+from app.schemas.logistics import PurchaseUnitRequest, RepairRequest, ScrapUnitRequest
+from app.services.logistics_service import LogisticsService
+
+router = APIRouter()
+
+
+@router.post("/repair", summary="Ремонт техники за SP")
+async def repair_unit(
+    request: RepairRequest,
+    sp_cost: int = Query(50, ge=0),
+    force_id: str = Query(...),
+    force: ForceModel = Depends(verify_force_ownership),
+    db: AsyncSession = Depends(get_db)
+):
+    """Восстанавливает поврежденный мех до статуса OPERATIONAL за SP."""
+    try:
+        repaired_unit = await LogisticsService.repair_unit(
+            db=db, force=force, unit_id=request.unit_id, sp_cost=sp_cost
+        )
+        return {"status": "repaired", "unit_id": repaired_unit.id, "remaining_sp": force.support_points}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/scrap", summary="Утилизация уничтоженной техники на лом")
+async def scrap_unit(
+    request: ScrapUnitRequest,
+    force_id: str = Query(...),
+    force: ForceModel = Depends(verify_force_ownership),
+    db: AsyncSession = Depends(get_db)
+):
+    """Списывает полностью уничтоженный мех (TRULY_DESTROYED) и зачисляет 25% стоимости в SP."""
+    try:
+        sp_yield = await LogisticsService.scrap_unit(db=db, force=force, unit_id=request.unit_id)
+        return {"status": "scrapped", "sp_earned": sp_yield, "total_sp": force.support_points}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.post("/buy-unit", summary="Покупка новой техники")
+async def buy_unit(
+    request: PurchaseUnitRequest,
+    force_id: str = Query(...),
+    force: ForceModel = Depends(verify_force_ownership),
+    db: AsyncSession = Depends(get_db)
+):
+    """Приобретает новый мех и привязывает его к ростеру отряда."""
+    try:
+        new_unit = await LogisticsService.buy_unit(db=db, force=force, request=request)
+        return {"status": "purchased", "unit": new_unit, "remaining_sp": force.support_points}
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/rat-roll", summary="Ролл по таблицам RAT (Random Assignment Tables)")
+async def rat_roll(
+    faction: Faction = Query(...),
+    weight_class: WeightClass = Query(...),
+    unit_rating: str = Query("Scale 1", pattern=r"^Scale [1-3]$")
+):
+    """Генерирует случайный мех по таблицам RAT региона Draconis Reach."""
+    sample_mechs = {
+        WeightClass.LIGHT: [("Panther", "PTH-9R"), ("Jenner", "JR7-D"), ("Locust", "LCT-1E")],
+        WeightClass.MEDIUM: [("Starslayer", "STAGE-3C"), ("Phoenix Hawk", "PXH-1K"), ("Centurion", "CN9-A")],
+        WeightClass.HEAVY: [("Dragon", "DRG-1N"), ("Catapult", "CPLT-C1"), ("Grasshopper", "GHR-5H")],
+        WeightClass.ASSAULT: [("Awesome", "AWS-8Q"), ("BattleMaster", "BLR-1D"), ("Stalker", "STK-3H")],
+    }
+    chassis, model = random.choice(sample_mechs[weight_class])
+    return {
+        "faction": faction,
+        "weight_class": weight_class,
+        "unit_rating": unit_rating,
+        "rolled_mech": {"chassis": chassis, "model": model}
+    }
+````
+
+## File: app/api/v1/endpoints/pilots.py
+````python
+from fastapi import APIRouter, Depends, HTTPException, Path, status
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.database import get_db
+from app.db.models.pilot import PilotModel
+from app.db.models.user import UserModel
+from app.dependencies.auth import get_current_user
+from app.schemas.pilot import NamedPilot, PilotUpgradeRequest
+from app.services.pilot_service import PilotService
+
+router = APIRouter()
+
+
+@router.get("/{pilot_id}", response_model=NamedPilot, summary="Информация о пилоте")
+async def get_pilot(
+    pilot_id: str = Path(..., description="UUID пилота"),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """Возвращает карточку пилота из СУБД."""
+    stmt = select(PilotModel).where(PilotModel.id == pilot_id)
+    res = await db.execute(stmt)
+    pilot = res.scalar_one_or_none()
+    if not pilot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пилот не найден")
+    return pilot
+
+
+@router.post("/{pilot_id}/upgrade", response_model=NamedPilot, summary="Прокачка пилота за XP")
+async def upgrade_pilot(
+    request: PilotUpgradeRequest,
+    pilot_id: str = Path(..., description="UUID пилота"),
+    db: AsyncSession = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """
+    Транзакционно улучшает навык Gunnery/Piloting, добавляет Edge или покупает SPA за XP.
+    
+    * **400 Bad Request**: Недостаточно XP (`InsufficientXPError`) или достигнут предел.
+    """
+    stmt = select(PilotModel).where(PilotModel.id == pilot_id)
+    res = await db.execute(stmt)
+    pilot = res.scalar_one_or_none()
+    if not pilot:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пилот не найден")
+
+    try:
+        return await PilotService.upgrade_pilot(db=db, pilot=pilot, request=request)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+````
+
+## File: app/api/v1/__init__.py
+````python
+
+````
+
+## File: app/api/v1/api.py
+````python
+from fastapi import APIRouter
+from app.api.v1.endpoints import auth, contracts, forces, generator, logistics, pilots, tracks
+
+api_router = APIRouter()
+
+api_router.include_router(auth.router, prefix="/auth", tags=["Auth"])
+api_router.include_router(forces.router, prefix="/forces", tags=["Forces"])
+api_router.include_router(pilots.router, prefix="/pilots", tags=["Pilots"])
+api_router.include_router(contracts.router, prefix="/contracts", tags=["Contracts"])
+api_router.include_router(tracks.router, prefix="/tracks", tags=["Tracks"])
+api_router.include_router(logistics.router, prefix="/logistics", tags=["Logistics"])
+api_router.include_router(generator.router, prefix="/generator", tags=["Generator"])
+````
+
+## File: app/api/__init__.py
+````python
+
+````
+
+## File: app/core/__init__.py
+````python
+
+````
+
+## File: app/core/security.py
+````python
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional, Union
+import bcrypt
+import jwt
+from app.config import settings
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """Проверяет соответствие открытого пароля сохраненному хэшу."""
+    password_bytes = plain_password.encode("utf-8")[:72]
+    hashed_bytes = hashed_password.encode("utf-8")
+    return bcrypt.checkpw(password_bytes, hashed_bytes)
+
+
+def get_password_hash(password: str) -> str:
+    """Генерирует хэш bcrypt для пароля с обрезкой до 72 байт."""
+    password_bytes = password.encode("utf-8")[:72]
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(password_bytes, salt).decode("utf-8")
+
+
+def create_access_token(
+    subject: Union[str, Any], expires_delta: Optional[timedelta] = None
+) -> str:
+    """Создает подписанный JWT токен доступа."""
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+
+    to_encode = {
+        "exp": expire,
+        "sub": str(subject),
+        "commander_id": str(subject),
+    }
+    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+````
+
+## File: app/db/models/__init__.py
+````python
+from app.db.models.user import UserModel
+from app.db.models.force import ForceModel, MechUnitModel
+from app.db.models.pilot import PilotModel
+
+__all__ = ["UserModel", "ForceModel", "MechUnitModel", "PilotModel"]
+````
+
+## File: app/db/__init__.py
+````python
+
+````
+
+## File: app/db/database.py
+````python
+from typing import AsyncGenerator
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import DeclarativeBase
+from app.config import settings
+
+# Асинхронный движок SQLAlchemy
+engine = create_async_engine(
+    settings.DATABASE_URL,
+    echo=False,
+    future=True,
+    pool_pre_ping=True
+)
+
+# Фабрика асинхронных сессий
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False
+)
+
+
+class Base(DeclarativeBase):
+    """Базовый декларативный класс для всех моделей СУБД."""
+    pass
+
+
+async def get_db() -> AsyncGenerator[AsyncSession, None]:
+    """
+    FastAPI Dependency для инъекции асинхронной сессии базы данных.
+    Автоматически фиксирует транзакцию при успехе или откатывает при ошибке.
+    """
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+````
+
+## File: app/dependencies/__init__.py
+````python
+
+````
+
+## File: app/dependencies/auth.py
+````python
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings
+from app.db.database import get_db
+from app.db.models.user import UserModel
+from app.schemas.auth import TokenData
+
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl=f"{settings.API_V1_STR}/auth/token"
+)
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> UserModel:
+    """Извлекает и валидирует текущего пользователя из JWT токена."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Не удалось валидировать учетные данные",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        payload = jwt.decode(
+            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
+        )
+        commander_id: str = payload.get("sub") or payload.get("commander_id")
+        if commander_id is None:
+            raise credentials_exception
+        token_data = TokenData(commander_id=commander_id)
+    except jwt.PyJWTError:
+        raise credentials_exception
+
+    stmt = select(UserModel).where(UserModel.id == token_data.commander_id)
+    result = await db.execute(stmt)
+    user = result.scalar_one_or_none()
+
+    if user is None:
+        raise credentials_exception
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Пользователь неактивен"
+        )
+
+    return user
+````
+
+## File: app/dependencies/campaign.py
+````python
+from fastapi import Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.database import get_db
+from app.db.models.force import ForceModel
+from app.db.models.user import UserModel
+from app.dependencies.auth import get_current_user
+
+
+async def verify_force_ownership(
+    force_id: str,
+    current_user: UserModel = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+) -> ForceModel:
+    """Проверяет существование отряда в СУБД и права доступа текущего пользователя."""
+    stmt = (
+        select(ForceModel)
+        .where(ForceModel.id == force_id)
+        .options(
+            selectinload(ForceModel.units),
+            selectinload(ForceModel.pilots)
+        )
+    )
+    result = await db.execute(stmt)
+    force = result.scalar_one_or_none()
+
+    if force is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Отряд с ID '{force_id}' не найден"
+        )
+
+    if force.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="У вас нет прав для управления этим отрядом"
+        )
+
+    return force
+````
+
+## File: app/dependencies/db.py
+````python
+from app.db.database import get_db
+
+__all__ = ["get_db"]
+````
+
+## File: app/schemas/__init__.py
+````python
+from app.schemas.auth import Token, TokenData, UserLogin, UserRegister, UserResponse
+from app.schemas.pilot import NamedPilot, SkillUpgrade, EdgeUpgrade, AbilityUpgrade, PilotUpgradeRequest
+from app.schemas.force import Faction, UnitStatus, WeightClass, MechUnit, ForceCreate, ForceResponse, AssignPilotRequest
+from app.schemas.contract import CommandRights, SalvageRights, ContractTerms, ContractNegotiationOffer, ContractResponse
+from app.schemas.track import PilotTrackPerformance, TrackCompletionRequest, XPAllocationResult, TrackCompletionResponse
+from app.schemas.logistics import RepairRequest, ScrapUnitRequest, PurchaseUnitRequest, RATRollQuery
+from app.schemas.generator import ContractGenerateRequest
+
+__all__ = [
+    "Token", "TokenData", "UserLogin", "UserRegister", "UserResponse",
+    "NamedPilot", "SkillUpgrade", "EdgeUpgrade", "AbilityUpgrade", "PilotUpgradeRequest",
+    "Faction", "UnitStatus", "WeightClass", "MechUnit", "ForceCreate", "ForceResponse", "AssignPilotRequest",
+    "CommandRights", "SalvageRights", "ContractTerms", "ContractNegotiationOffer", "ContractResponse",
+    "PilotTrackPerformance", "TrackCompletionRequest", "XPAllocationResult", "TrackCompletionResponse",
+    "RepairRequest", "ScrapUnitRequest", "PurchaseUnitRequest", "RATRollQuery",
+    "ContractGenerateRequest",
+]
+````
+
+## File: app/schemas/auth.py
+````python
+from typing import Optional
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class Token(BaseModel):
+    """Ответ API с JWT токеном доступа."""
+    access_token: str = Field(..., description="JWT токен доступа")
+    token_type: str = Field(default="bearer", description="Тип токена")
+
+
+class TokenData(BaseModel):
+    """Данные, зашифрованные внутри JWT токена."""
+    commander_id: Optional[str] = Field(None, description="UUID командира в БД")
+
+
+class UserLogin(BaseModel):
+    """Схема входа пользователя."""
+    username: str = Field(..., min_length=3, max_length=50, json_schema_extra={"example": "commander_vance"})
+    password: str = Field(..., min_length=4, json_schema_extra={"example": "strongpassword123"})
+
+
+class UserRegister(BaseModel):
+    """Схема регистрации нового командира в СУБД."""
+    username: str = Field(..., min_length=3, max_length=50, json_schema_extra={"example": "commander_vance"})
+    password: str = Field(..., min_length=6, json_schema_extra={"example": "strongpassword123"})
+
+
+class UserResponse(BaseModel):
+    """Публичные данные пользователя."""
+    id: str = Field(..., description="Уникальный UUID пользователя в БД")
+    username: str
+    is_active: bool = True
+
+    model_config = ConfigDict(from_attributes=True)
+````
+
+## File: app/schemas/generator.py
+````python
+from typing import Optional
+from pydantic import BaseModel, Field
+from app.schemas.force import Faction
+
+
+class ContractGenerateRequest(BaseModel):
+    """Параметры процедуры генерации случайного контракта."""
+    employer: Optional[Faction] = Field(None, description="Целевой наниматель")
+    target_faction: Optional[Faction] = Field(None, description="Вражеская фракция")
+    location_hot_spot: Optional[str] = Field(None, description="Локация в Draconis Reach")
+````
+
+## File: app/schemas/logistics.py
+````python
+from pydantic import BaseModel, Field
+from app.schemas.force import Faction, WeightClass
+
+
+class RepairRequest(BaseModel):
+    """Запрос на ремонт поврежденной техники за SP."""
+    unit_id: str = Field(..., description="ID поврежденного меха")
+
+
+class ScrapUnitRequest(BaseModel):
+    """Запрос на утилизацию уничтоженной техники (TRULY_DESTROYED) на лом."""
+    unit_id: str = Field(..., description="ID техники для утилизации в SP в БД")
+
+
+class PurchaseUnitRequest(BaseModel):
+    """Запрос на покупку новой единицы техники."""
+    chassis: str = Field(..., json_schema_extra={"example": "Catapult"})
+    model: str = Field(..., json_schema_extra={"example": "CPLT-C1"})
+    tonnage: int = Field(..., ge=20, le=100, json_schema_extra={"example": 65})
+    weight_class: WeightClass = Field(..., json_schema_extra={"example": WeightClass.HEAVY})
+    bv2: int = Field(..., ge=100, le=5000, json_schema_extra={"example": 1399})
+    cost_sp: int = Field(..., ge=0, json_schema_extra={"example": 300})
+
+
+class RATRollQuery(BaseModel):
+    """Параметры генерации случайной техники по RAT-таблицам."""
+    faction: Faction
+    unit_rating: str = Field(..., pattern=r"^Scale [1-3]$", description="Рейтинг подразделения (Scale 1, Scale 2, Scale 3)")
+    weight_class: WeightClass
+````
+
+## File: app/schemas/pilot.py
+````python
+from typing import Annotated, List, Literal, Union, Optional
+from pydantic import BaseModel, Field, ConfigDict
+
+
+class NamedPilot(BaseModel):
+    """Модель именного пилота отряда наемников."""
+    id: str = Field(..., description="Уникальный UUID пилота в БД")
+    force_id: Optional[str] = Field(None, description="ID отряда в БД")
+    name: str = Field(..., min_length=2, max_length=50, json_schema_extra={"example": "Maverick Banderas"})
+    gunnery: int = Field(default=4, ge=0, le=8, description="Навык стрельбы (чем ниже, тем лучше)")
+    piloting: int = Field(default=5, ge=0, le=8, description="Навык пилотирования (чем ниже, тем лучше)")
+    
+    # Система опыта (XP)
+    experience_points: int = Field(default=0, ge=0, description="Доступные очки опыта (XP)")
+    total_xp_earned: int = Field(default=0, ge=0, description="Всего заработано XP за кампанию")
+    
+    # Способности и Edge
+    edge_points: int = Field(default=1, ge=0, le=10, description="Текущее значение Edge (0-10)")
+    special_abilities: List[str] = Field(
+        default_factory=list, 
+        json_schema_extra={"example": ["Overcharge", "Dodge", "Marksman"]},
+        description="Купленные спец-способности (SPAs) и способности Edge"
+    )
+    is_temporary_hire: bool = Field(default=False)
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# --- Discriminated Unions для полиморфных запросов на улучшение пилота ---
+
+class SkillUpgrade(BaseModel):
+    """Улучшение навыка стрельбы или пилотирования."""
+    upgrade_type: Literal["gunnery", "piloting"]
+
+
+class EdgeUpgrade(BaseModel):
+    """Покупка дополнительного очка Edge."""
+    upgrade_type: Literal["edge"]
+
+
+class AbilityUpgrade(BaseModel):
+    """Покупка специальной способности (SPA)."""
+    upgrade_type: Literal["ability"]
+    ability_name: str = Field(..., min_length=2, description="Название спец-способности (SPA)")
+
+
+PilotUpgradeRequest = Annotated[
+    Union[SkillUpgrade, EdgeUpgrade, AbilityUpgrade], 
+    Field(discriminator="upgrade_type")
+]
+````
+
+## File: app/services/__init__.py
+````python
+from app.services.pilot_service import PilotService
+from app.services.negotiation_engine import NegotiationEngine
+from app.services.force_service import ForceService
+from app.services.track_service import TrackService
+from app.services.logistics_service import LogisticsService
+from app.services.generator_service import GeneratorService
+
+__all__ = [
+    "PilotService",
+    "NegotiationEngine",
+    "ForceService",
+    "TrackService",
+    "LogisticsService",
+    "GeneratorService",
+]
+````
+
+## File: app/services/logistics_service.py
+````python
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.db.models.force import ForceModel, MechUnitModel
+from app.schemas.force import UnitStatus
+from app.schemas.logistics import PurchaseUnitRequest
+
+
+class LogisticsService:
+    @staticmethod
+    async def repair_unit(db: AsyncSession, force: ForceModel, unit_id: str, sp_cost: int) -> MechUnitModel:
+        """Ремонтирует поврежденный мех за SP, возвращая ему статус OPERATIONAL."""
+        if force.support_points < sp_cost:
+            raise ValueError(f"Недостаточно SP для ремонта. Требуется: {sp_cost}, доступно: {force.support_points}")
+
+        stmt = select(MechUnitModel).where(MechUnitModel.id == unit_id, MechUnitModel.force_id == force.id)
+        res = await db.execute(stmt)
+        unit = res.scalar_one_or_none()
+
+        if not unit:
+            raise ValueError("Техника не найдена в отряде")
+
+        force.support_points -= sp_cost
+        unit.status = UnitStatus.OPERATIONAL
+        db.add_all([force, unit])
+        await db.flush()
+        return unit
+
+    @staticmethod
+    async def scrap_unit(db: AsyncSession, force: ForceModel, unit_id: str) -> int:
+        """
+        Утилизирует уничтоженный мех (TRULY_DESTROYED) на лом.
+        Зачисляет 25% его базовой стоимости в SP и удаляет объект из БД.
+        """
+        stmt = select(MechUnitModel).where(MechUnitModel.id == unit_id, MechUnitModel.force_id == force.id)
+        res = await db.execute(stmt)
+        unit = res.scalar_one_or_none()
+
+        if not unit:
+            raise ValueError("Техника не найдена в отряде")
+        if unit.status != UnitStatus.TRULY_DESTROYED:
+            raise ValueError("На лом можно распилить только полностью уничтоженную технику (TRULY_DESTROYED)")
+
+        # Расчет 25% стоимости от тоннажа/BV2 в SP
+        sp_yield = int((unit.tonnage * 10) * 0.25)
+        force.support_points += sp_yield
+
+        await db.delete(unit)
+        db.add(force)
+        await db.flush()
+        return sp_yield
+
+    @staticmethod
+    async def buy_unit(db: AsyncSession, force: ForceModel, request: PurchaseUnitRequest) -> MechUnitModel:
+        """Покупка новой техники за SP."""
+        if force.support_points < request.cost_sp:
+            raise ValueError(f"Недостаточно SP для покупки. Требуется: {request.cost_sp}, доступно: {force.support_points}")
+
+        force.support_points -= request.cost_sp
+        new_unit = MechUnitModel(
+            force_id=force.id,
+            chassis=request.chassis,
+            model=request.model,
+            tonnage=request.tonnage,
+            weight_class=request.weight_class,
+            bv2=request.bv2,
+            status=UnitStatus.OPERATIONAL
+        )
+        db.add_all([force, new_unit])
+        await db.flush()
+        return new_unit
+````
+
+## File: app/tests/__init__.py
+````python
+
+````
+
+## File: app/tests/test_force.py
+````python
+import pytest
+from httpx import AsyncClient
+from app.config import settings
+
+
+async def test_create_force_v6_success(client: AsyncClient, auth_headers: dict):
+    payload = {
+        "name": "Iron Hand Mercenaries",
+        "sponsoring_faction": "Draconis Combine",
+        "starting_pilot_names": ["Kenshin", "Saito"],
+        "selected_mechs": [
+            {"chassis": "Panther", "model": "PNT-9R", "tonnage": 35, "weight_class": "Light", "bv2": 769},
+            {"chassis": "Dragon", "model": "DRG-1N", "tonnage": 60, "weight_class": "Heavy", "bv2": 1125}
+        ]
+    }
+
+    response = await client.post(f"{settings.API_V1_STR}/forces/", json=payload, headers=auth_headers)
+
+    assert response.status_code == 201
+    data = response.json()
+    assert data["support_points"] == 3000
+    assert data["reputation_score"] == 1
+    assert len(data["pilots"]) == 2
+    assert data["pilots"][0]["experience_points"] == 150
+    assert len(data["units"]) == 2
+
+
+async def test_create_force_v6_exceed_bv2_limit(client: AsyncClient, auth_headers: dict):
+    payload = {
+        "name": "Heavy Assault Mercs",
+        "sponsoring_faction": "Draconis Combine",
+        "starting_pilot_names": ["Pilot A", "Pilot B"],
+        "selected_mechs": [
+            {"chassis": "Atlas", "model": "AS7-D", "tonnage": 100, "weight_class": "Assault", "bv2": 1897},
+            {"chassis": "Awesome", "model": "AWS-8Q", "tonnage": 80, "weight_class": "Assault", "bv2": 1605}
+        ]  # Итого: 3502 BV2 > 3000 BV2
+    }
+
+    response = await client.post(f"{settings.API_V1_STR}/forces/", json=payload, headers=auth_headers)
+
+    assert response.status_code == 422
+````
+
+## File: app/__init__.py
+````python
+
+````
+
+## File: frontend/src/components/common/ProtectedRoute.tsx
+````typescript
+import React from 'react';
+import { Navigate, Outlet } from 'react-router-dom';
+import { useAuthStore } from '../../store/authStore';
+
+export const ProtectedRoute: React.FC = () => {
+  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
+
+  if (!isAuthenticated) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return <Outlet />;
+};
+````
+
 ## File: frontend/src/components/domain/ContractNegotiationModal.tsx
 ````typescript
 import React, { useState } from 'react';
@@ -346,6 +1148,160 @@ export const ContractNegotiationModal: React.FC<ContractNegotiationModalProps> =
             </button>
           </div>
         </form>
+      </div>
+    </div>
+  );
+};
+````
+
+## File: frontend/src/components/domain/MechStatusBadge.tsx
+````typescript
+import React from 'react';
+import { UnitStatus } from '../../types';
+
+interface MechStatusBadgeProps {
+  status: UnitStatus;
+}
+
+export const MechStatusBadge: React.FC<MechStatusBadgeProps> = ({ status }) => {
+  switch (status) {
+    case UnitStatus.OPERATIONAL:
+      return (
+        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-emerald-950/80 text-emerald-400 border border-emerald-500/40">
+          Боеспособен
+        </span>
+      );
+    case UnitStatus.DAMAGED:
+      return (
+        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-amber-950/80 text-amber-400 border border-amber-500/40">
+          Поврежден
+        </span>
+      );
+    case UnitStatus.DESTROYED:
+      return (
+        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-orange-950/80 text-orange-400 border border-orange-500/40">
+          Уничтожен
+        </span>
+      );
+    case UnitStatus.TRULY_DESTROYED:
+      return (
+        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-red-950/80 text-red-400 border border-red-500/40 animate-pulse">
+          Полный лом
+        </span>
+      );
+    default:
+      return (
+        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-slate-800 text-slate-400">
+          {status}
+        </span>
+      );
+  }
+};
+````
+
+## File: frontend/src/pages/Auth/LoginPage.tsx
+````typescript
+import React, { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { useAuthStore } from '../../store/authStore';
+import { authApi } from '../../api/services';
+import { Shield, Lock, User as UserIcon } from 'lucide-react';
+
+export const LoginPage: React.FC = () => {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const setToken = useAuthStore((state) => state.setToken);
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setIsLoading(true);
+
+    try {
+      const formData = new FormData();
+      formData.append('username', username);
+      formData.append('password', password);
+
+      const res = await authApi.login(formData);
+      setToken(res.data.access_token);
+      navigate('/');
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Ошибка авторизации');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-bt-bg flex items-center justify-center p-4">
+      <div className="w-full max-w-md bg-bt-card border border-bt-border rounded-lg p-6 shadow-xl">
+        <div className="flex items-center justify-center gap-3 mb-6">
+          <Shield className="w-8 h-8 text-bt-amber" />
+          <h1 className="text-xl font-bold text-white tracking-wide">
+            DRCM TERMINAL <span className="text-bt-amber text-xs">v0.2</span>
+          </h1>
+        </div>
+
+        {error && (
+          <div className="mb-4 p-3 bg-red-900/50 border border-bt-red text-red-200 text-sm rounded">
+            {error}
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
+              Позывной Командира
+            </label>
+            <div className="relative">
+              <UserIcon className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
+              <input
+                type="text"
+                required
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
+                placeholder="Commander"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
+              Пароль
+            </label>
+            <div className="relative">
+              <Lock className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
+              <input
+                type="password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
+                placeholder="••••••••"
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isLoading}
+            className="w-full bg-bt-amber hover:bg-amber-600 text-slate-950 font-bold py-2 px-4 rounded transition-colors disabled:opacity-50"
+          >
+            {isLoading ? 'Подключение...' : 'Вход в терминал'}
+          </button>
+        </form>
+
+        <p className="mt-4 text-center text-sm text-slate-400">
+          Нет аккаунта?{' '}
+          <Link to="/register" className="text-bt-amber hover:underline">
+            Зарегистрировать отряд
+          </Link>
+        </p>
       </div>
     </div>
   );
@@ -595,6 +1551,539 @@ export const ContractsPage: React.FC = () => {
           }}
         />
       )}
+    </div>
+  );
+};
+````
+
+## File: frontend/src/pages/ForceSelection/ForceSelectionPage.tsx
+````typescript
+import React, { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { forcesApi } from '../../api/services';
+import { useAuthStore } from '../../store/authStore';
+import { 
+  Shield, 
+  PlusCircle, 
+  Coins, 
+  Award, 
+  Crosshair, 
+  Users, 
+  ArrowRight, 
+  LogOut,
+  Trash2
+} from 'lucide-react';
+
+export const ForceSelectionPage: React.FC = () => {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const logout = useAuthStore((state) => state.logout);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+
+  const { data: forces, isLoading, error } = useQuery({
+    queryKey: ['my-forces'],
+    queryFn: () => forcesApi.getMyForces(),
+  });
+
+  // Мутация удаления отряда
+  const deleteMutation = useMutation({
+    mutationFn: (forceId: string) => forcesApi.deleteForce(forceId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['my-forces'] });
+      setDeletingId(null);
+    },
+    onError: (err) => {
+      console.error("Ошибка при удалении отряда:", err);
+      alert("Не удалось удалить отряд. Попробуйте еще раз.");
+      setDeletingId(null);
+    }
+  });
+
+  const handleDelete = (e: React.MouseEvent, forceId: string, forceName: string) => {
+    e.stopPropagation(); // Предотвращаем переход на страницу отряда при клике на корзину
+    if (window.confirm(`Вы уверены, что хотите расформировать отряд "${forceName}"? Вся техника и пилоты будут удалены из базы данных.`)) {
+      setDeletingId(forceId);
+      deleteMutation.mutate(forceId);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-bt-bg text-white flex items-center justify-center font-mono">
+        <p className="text-bt-amber animate-pulse">Загрузка реестра ваших отрядов...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-bt-bg text-white p-6 flex flex-col items-center">
+      <div className="w-full max-w-6xl">
+        {/* Шапка */}
+        <div className="flex justify-between items-center mb-8 border-b border-bt-border pb-4">
+          <div className="flex items-center gap-3">
+            <Shield className="w-8 h-8 text-bt-amber" />
+            <div>
+              <h1 className="text-2xl font-bold tracking-wider uppercase text-white">
+                Командный Штаб
+              </h1>
+              <p className="text-xs text-slate-400">Выберите активный отряд или сформируйте новый</p>
+            </div>
+          </div>
+          <button
+            onClick={logout}
+            className="flex items-center gap-1.5 bg-red-950/60 hover:bg-red-900 border border-bt-red/40 text-red-300 font-bold px-3 py-2 rounded text-xs transition-colors"
+          >
+            <LogOut className="w-4 h-4" /> Выход
+          </button>
+        </div>
+
+        {error && (
+          <div className="mb-6 p-4 bg-red-900/50 border border-bt-red rounded text-red-200 text-sm">
+            Не удалось загрузить список отрядов. Проверьте соединение с сервером.
+          </div>
+        )}
+
+        {/* Сетка отрядов */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {/* Карточка создания нового отряда */}
+          <Link
+            to="/forces/create"
+            className="bg-bt-card/50 hover:bg-bt-card border-2 border-dashed border-bt-border hover:border-bt-amber rounded-xl p-6 shadow-lg transition-all flex flex-col items-center justify-center text-center gap-3 min-h-[220px] group"
+          >
+            <div className="w-12 h-12 rounded-full bg-slate-900 border border-bt-border flex items-center justify-center group-hover:border-bt-amber group-hover:text-bt-amber transition-colors">
+              <PlusCircle className="w-6 h-6 text-slate-400 group-hover:text-bt-amber" />
+            </div>
+            <div>
+              <div className="font-bold text-white text-base group-hover:text-bt-amber transition-colors">
+                Сформировать новый отряд
+              </div>
+              <p className="text-xs text-slate-400 mt-1">
+                Стартовый баланс: 3000 SP, 2 пилота, техника из RAT
+              </p>
+            </div>
+          </Link>
+
+          {/* Превью существующих отрядов */}
+          {forces &&
+            forces.map((force) => (
+              <div
+                key={force.id}
+                onClick={() => navigate(`/forces/${force.id}`)}
+                className={`bg-bt-card border border-bt-border hover:border-bt-amber/60 rounded-xl p-6 shadow-xl transition-all cursor-pointer flex flex-col justify-between hover:translate-y-[-2px] group relative ${
+                  deletingId === force.id ? 'opacity-40 pointer-events-none' : ''
+                }`}
+              >
+                <div>
+                  <div className="flex justify-between items-start mb-2 gap-2">
+                    <h2 className="font-bold text-lg text-white group-hover:text-bt-amber transition-colors truncate">
+                      {force.name}
+                    </h2>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      <span className="text-[10px] uppercase font-mono bg-bt-amber/10 border border-bt-amber/30 text-bt-amber px-2 py-0.5 rounded">
+                        {force.sponsoring_faction}
+                      </span>
+                      <button
+                        onClick={(e) => handleDelete(e, force.id, force.name)}
+                        className="p-1.5 bg-slate-900 hover:bg-red-950 border border-bt-border hover:border-red-500/50 rounded text-slate-400 hover:text-red-400 transition-colors"
+                        title="Удалить отряд"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Статистика */}
+                  <div className="grid grid-cols-2 gap-2 bg-slate-900/80 p-3 rounded-lg border border-bt-border/50 my-4 text-xs">
+                    <div className="flex items-center gap-2">
+                      <Coins className="w-4 h-4 text-bt-amber" />
+                      <div>
+                        <span className="text-slate-500 block text-[9px] uppercase font-bold">Warchest (SP)</span>
+                        <span className="font-mono font-bold text-bt-amber">{force.support_points} SP</span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2">
+                      <Award className="w-4 h-4 text-bt-green" />
+                      <div>
+                        <span className="text-slate-500 block text-[9px] uppercase font-bold">Репутация</span>
+                        <span className="font-mono font-bold text-white">{force.reputation_score}</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex justify-between text-xs text-slate-400 border-t border-bt-border/40 pt-3">
+                    <span className="flex items-center gap-1">
+                      <Crosshair className="w-3.5 h-3.5 text-slate-500" /> Техники: <strong className="text-slate-200">{force.units?.length || 0}</strong>
+                    </span>
+                    <span className="flex items-center gap-1">
+                      <Users className="w-3.5 h-3.5 text-slate-500" /> Пилотов: <strong className="text-slate-200">{force.pilots?.length || 0}</strong>
+                    </span>
+                  </div>
+                </div>
+
+                <div className="mt-5 flex items-center justify-end text-xs font-bold text-bt-amber group-hover:underline gap-1">
+                  Открыть терминал <ArrowRight className="w-4 h-4" />
+                </div>
+              </div>
+            ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+````
+
+## File: frontend/src/pages/ForceWizard/ForceCreationPage.tsx
+````typescript
+import React, { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { forcesApi } from '../../api/services';
+import type { StartingFactionOption, StartingMechSelection } from '../../types';
+import { Faction } from '../../types';
+import { Shield, Users, Crosshair, AlertTriangle, CheckCircle, ChevronRight, ChevronLeft } from 'lucide-react';
+
+export const ForceCreationPage: React.FC = () => {
+  const navigate = useNavigate();
+  const [step, setStep] = useState(1);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Опции с сервера
+  const [factionOptions, setFactionOptions] = useState<StartingFactionOption[]>([]);
+  const [maxBV2, setMaxBV2] = useState(3000);
+
+  // Форма отряда
+  const [forceName, setForceName] = useState('');
+  const [selectedFaction, setSelectedFaction] = useState<Faction>(Faction.MERCENARY);
+  const [pilot1, setPilot1] = useState('Pilot Alpha');
+  const [pilot2, setPilot2] = useState('Pilot Bravo');
+  const [selectedMechs, setSelectedMechs] = useState<StartingMechSelection[]>([]);
+
+  useEffect(() => {
+    const fetchOptions = async () => {
+      try {
+        const data = await forcesApi.getStartingOptions();
+        if (data.available_factions && data.available_factions.length > 0) {
+          setFactionOptions(data.available_factions);
+          setSelectedFaction(data.available_factions[0].faction);
+        }
+        if (data.max_starting_bv2) setMaxBV2(data.max_starting_bv2);
+      } catch (err: any) {
+        // Фоллбек-данные для разработки
+        setFactionOptions([
+          {
+            faction: Faction.MERCENARY,
+            display_name: 'Mercenary',
+            description: 'Наемные подразделения',
+            available_rat_mechs: [
+              { chassis: 'Locust', model: 'LCT-1V', tonnage: 20, weight_class: 'Light' as any, bv2: 532 },
+              { chassis: 'Commando', model: 'COM-2D', tonnage: 25, weight_class: 'Light' as any, bv2: 541 },
+              { chassis: 'Centurion', model: 'CN9-A', tonnage: 50, weight_class: 'Medium' as any, bv2: 945 },
+              { chassis: 'Shadow Hawk', model: 'SHD-2H', tonnage: 55, weight_class: 'Medium' as any, bv2: 1064 },
+              { chassis: 'Warhammer', model: 'WHM-6R', tonnage: 70, weight_class: 'Heavy' as any, bv2: 1299 }
+            ]
+          }
+        ]);
+      } finally {
+        setIsLoading(false);
+      }
+    };
+    fetchOptions();
+  }, []);
+
+  const activeFactionObj = factionOptions.find((f) => f.faction === selectedFaction) || factionOptions[0];
+  const availableRatMechs = activeFactionObj?.available_rat_mechs || [];
+
+  const totalBV2 = selectedMechs.reduce((sum, mech) => sum + mech.bv2, 0);
+  const isBV2Exceeded = totalBV2 > maxBV2;
+  const isMechCountExceeded = selectedMechs.length > 2;
+
+  const toggleMechSelection = (mech: StartingMechSelection) => {
+    const exists = selectedMechs.some((m) => m.model === mech.model && m.chassis === mech.chassis);
+    if (exists) {
+      setSelectedMechs(selectedMechs.filter((m) => !(m.model === mech.model && m.chassis === mech.chassis)));
+    } else {
+      if (selectedMechs.length >= 2) return;
+      setSelectedMechs([...selectedMechs, mech]);
+    }
+  };
+
+  const handleSubmit = async () => {
+    if (isBV2Exceeded || isMechCountExceeded || selectedMechs.length === 0) return;
+    setError(null);
+    setIsSubmitting(true);
+
+    try {
+      const newForce = await forcesApi.createForce({
+        name: forceName,
+        sponsoring_faction: selectedFaction,
+        starting_pilot_names: [pilot1, pilot2],
+        selected_mechs: selectedMechs,
+      });
+      navigate(`/forces/${newForce.id}`);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Не удалось сформировать отряд');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-bt-bg text-white flex items-center justify-center">
+        <p className="text-bt-amber animate-pulse font-mono">Загрузка стартовых параметров v0.2...</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-bt-bg text-white p-6 flex flex-col items-center">
+      <div className="w-full max-w-4xl">
+        <div className="mb-8 text-center">
+          <h1 className="text-2xl font-bold text-bt-amber tracking-wider uppercase mb-2">
+            Мастер формирования наемного отряда
+          </h1>
+          <p className="text-slate-400 text-sm">Шаг {step} из 4</p>
+        </div>
+
+        {error && (
+          <div className="mb-6 p-4 bg-red-900/50 border border-bt-red rounded text-red-200 text-sm flex items-center gap-2">
+            <AlertTriangle className="w-5 h-5 flex-shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        <div className="bg-bt-card border border-bt-border rounded-lg p-6 shadow-2xl">
+          {/* Шаг 1: Название и Фракция */}
+          {step === 1 && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2 border-b border-bt-border pb-2">
+                <Shield className="text-bt-amber" /> Шаг 1: Название отряда и Фракция
+              </h2>
+              <div>
+                <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
+                  Название подразделения (3-50 символов)
+                </label>
+                <input
+                  type="text"
+                  value={forceName}
+                  onChange={(e) => setForceName(e.target.value)}
+                  placeholder="например: 2nd Iron Hounds"
+                  className="w-full bg-slate-900 border border-bt-border rounded p-3 text-white focus:outline-none focus:border-bt-amber"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
+                  Фракция происхождения
+                </label>
+                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
+                  {factionOptions.map((opt) => (
+                    <button
+                      key={opt.faction}
+                      type="button"
+                      onClick={() => {
+                        setSelectedFaction(opt.faction);
+                        setSelectedMechs([]);
+                      }}
+                      className={`p-3 rounded border text-left font-medium transition-colors ${
+                        selectedFaction === opt.faction
+                          ? 'bg-bt-amber/20 border-bt-amber text-bt-amber'
+                          : 'bg-slate-900 border-bt-border text-slate-300 hover:border-slate-500'
+                      }`}
+                    >
+                      <div className="font-bold">{opt.display_name || opt.faction}</div>
+                      {opt.description && <div className="text-xs text-slate-400 mt-1">{opt.description}</div>}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Шаг 2: Имена пилотов */}
+          {step === 2 && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2 border-b border-bt-border pb-2">
+                <Users className="text-bt-amber" /> Шаг 2: Стартовые мехварриоры
+              </h2>
+              <p className="text-xs text-bt-amber bg-bt-amber/10 p-3 rounded border border-bt-amber/30">
+                Каждый пилот получает 150 XP на старте для последующего развития навыков.
+              </p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
+                    Позывной пилота 1
+                  </label>
+                  <input
+                    type="text"
+                    value={pilot1}
+                    onChange={(e) => setPilot1(e.target.value)}
+                    className="w-full bg-slate-900 border border-bt-border rounded p-3 text-white focus:outline-none focus:border-bt-amber"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
+                    Позывной пилота 2
+                  </label>
+                  <input
+                    type="text"
+                    value={pilot2}
+                    onChange={(e) => setPilot2(e.target.value)}
+                    className="w-full bg-slate-900 border border-bt-border rounded p-3 text-white focus:outline-none focus:border-bt-amber"
+                  />
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Шаг 3: Техника из RAT */}
+          {step === 3 && (
+            <div className="space-y-6">
+              <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-bt-border pb-2 gap-2">
+                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
+                  <Crosshair className="text-bt-amber" /> Шаг 3: Выбор техники из RAT (до 2 мехов)
+                </h2>
+                <div className="flex gap-4 font-mono text-sm">
+                  <span className={selectedMechs.length > 2 ? 'text-bt-red font-bold' : 'text-slate-300'}>
+                    Выбрано: {selectedMechs.length} / 2
+                  </span>
+                  <span className={isBV2Exceeded ? 'text-bt-red font-bold' : 'text-bt-green'}>
+                    Суммарный BV2: {totalBV2} / {maxBV2}
+                  </span>
+                </div>
+              </div>
+
+              {isBV2Exceeded && (
+                <div className="p-3 bg-red-900/40 border border-bt-red text-red-200 text-xs rounded">
+                  Превышен лимит BV2! Сумма не должна превышать {maxBV2} BV2.
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-96 overflow-y-auto pr-2">
+                {availableRatMechs.map((mech) => {
+                  const isSelected = selectedMechs.some((m) => m.model === mech.model && m.chassis === mech.chassis);
+                  return (
+                    <div
+                      key={`${mech.chassis}-${mech.model}`}
+                      onClick={() => toggleMechSelection(mech)}
+                      className={`p-4 rounded border cursor-pointer transition-all ${
+                        isSelected
+                          ? 'bg-bt-amber/20 border-bt-amber'
+                          : 'bg-slate-900 border-bt-border hover:border-slate-500'
+                      }`}
+                    >
+                      <div className="flex justify-between items-start mb-2">
+                        <span className="font-bold text-white">{mech.chassis} {mech.model}</span>
+                        <span className="text-xs bg-slate-800 text-bt-amber px-2 py-1 rounded font-mono">
+                          {mech.bv2} BV2
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-400 flex justify-between">
+                        <span>Класс: {mech.weight_class}</span>
+                        <span>Тоннаж: {mech.tonnage} т</span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Шаг 4: Сводка */}
+          {step === 4 && (
+            <div className="space-y-6">
+              <h2 className="text-lg font-semibold text-white flex items-center gap-2 border-b border-bt-border pb-2">
+                <CheckCircle className="text-bt-green" /> Шаг 4: Итоговая сводка
+              </h2>
+
+              <div className="grid grid-cols-2 gap-4 bg-slate-900 p-4 rounded border border-bt-border text-sm">
+                <div>
+                  <span className="text-slate-400 block text-xs uppercase">Название:</span>
+                  <span className="font-bold text-white">{forceName}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-xs uppercase">Фракция:</span>
+                  <span className="font-bold text-bt-amber">{selectedFaction}</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-xs uppercase">Стартовый баланс:</span>
+                  <span className="font-bold text-bt-green">3000 SP</span>
+                </div>
+                <div>
+                  <span className="text-slate-400 block text-xs uppercase">Репутация:</span>
+                  <span className="font-bold text-white">1</span>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-xs uppercase font-bold text-slate-400 mb-2">Пилоты:</h3>
+                <div className="flex gap-4">
+                  <span className="bg-slate-900 border border-bt-border px-3 py-1 rounded text-sm text-slate-200">
+                    {pilot1} (150 XP)
+                  </span>
+                  <span className="bg-slate-900 border border-bt-border px-3 py-1 rounded text-sm text-slate-200">
+                    {pilot2} (150 XP)
+                  </span>
+                </div>
+              </div>
+
+              <div>
+                <h3 className="text-xs uppercase font-bold text-slate-400 mb-2">Выбранная техника:</h3>
+                <div className="grid grid-cols-2 gap-3">
+                  {selectedMechs.map((m) => (
+                    <div key={`${m.chassis}-${m.model}`} className="bg-slate-900 p-3 rounded border border-bt-border text-xs">
+                      <div className="font-bold text-white">{m.chassis} {m.model}</div>
+                      <div className="text-slate-400">{m.bv2} BV2 | {m.tonnage} т</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Панель навигации */}
+          <div className="mt-8 flex justify-between items-center pt-4 border-t border-bt-border">
+            {step > 1 ? (
+              <button
+                type="button"
+                onClick={() => setStep(step - 1)}
+                className="flex items-center gap-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold px-4 py-2 rounded transition-colors text-sm"
+              >
+                <ChevronLeft className="w-4 h-4" /> Назад
+              </button>
+            ) : (
+              <div />
+            )}
+
+            {step < 4 ? (
+              <button
+                type="button"
+                disabled={
+                  (step === 1 && forceName.trim().length < 3) ||
+                  (step === 2 && (!pilot1.trim() || !pilot2.trim())) ||
+                  (step === 3 && (selectedMechs.length === 0 || isBV2Exceeded))
+                }
+                onClick={() => setStep(step + 1)}
+                className="flex items-center gap-1 bg-bt-amber hover:bg-amber-600 text-slate-950 font-bold px-4 py-2 rounded transition-colors text-sm disabled:opacity-50"
+              >
+                Далее <ChevronRight className="w-4 h-4" />
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={isSubmitting}
+                onClick={handleSubmit}
+                className="bg-bt-green hover:bg-emerald-600 text-slate-950 font-bold px-6 py-2 rounded transition-colors text-sm disabled:opacity-50"
+              >
+                {isSubmitting ? 'Формирование...' : 'Сформировать отряд'}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 };
@@ -964,6 +2453,55 @@ export const PilotProgressionPage: React.FC = () => {
 };
 ````
 
+## File: frontend/src/store/authStore.ts
+````typescript
+import { create } from 'zustand';
+
+interface AuthState {
+  token: string | null;
+  isAuthenticated: boolean;
+  setToken: (token: string | null) => void;
+  logout: () => void;
+}
+
+export const useAuthStore = create<AuthState>((set) => ({
+  token: localStorage.getItem('token'),
+  isAuthenticated: !!localStorage.getItem('token'),
+  setToken: (token) => {
+    if (token) {
+      localStorage.setItem('token', token);
+      set({ token, isAuthenticated: true });
+    } else {
+      localStorage.removeItem('token');
+      set({ token: null, isAuthenticated: false });
+    }
+  },
+  logout: () => {
+    localStorage.removeItem('token');
+    set({ token: null, isAuthenticated: false });
+  },
+}));
+````
+
+## File: frontend/src/types/auth.ts
+````typescript
+export interface User {
+  id: string;
+  username: string;
+  is_active: boolean;
+}
+
+export interface Token {
+  access_token: string;
+  token_type: string;
+}
+
+export interface LoginPayload {
+  username: string;
+  password: string;
+}
+````
+
 ## File: frontend/src/utils/xpCalculator.ts
 ````typescript
 export const GUNNERY_UPGRADE_COSTS: Record<number, number> = {
@@ -1012,6 +2550,339 @@ export function getNextSPACost(currentAbilitiesCount: number): number | null {
 }
 ````
 
+## File: frontend/src/App.css
+````css
+.counter {
+  font-size: 16px;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--accent);
+  background: var(--accent-bg);
+  border: 2px solid transparent;
+  transition: border-color 0.3s;
+  margin-bottom: 24px;
+
+  &:hover {
+    border-color: var(--accent-border);
+  }
+  &:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+.hero {
+  position: relative;
+
+  .base,
+  .framework,
+  .vite {
+    inset-inline: 0;
+    margin: 0 auto;
+  }
+
+  .base {
+    width: 170px;
+    position: relative;
+    z-index: 0;
+  }
+
+  .framework,
+  .vite {
+    position: absolute;
+  }
+
+  .framework {
+    z-index: 1;
+    top: 34px;
+    height: 28px;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
+      scale(1.4);
+  }
+
+  .vite {
+    z-index: 0;
+    top: 107px;
+    height: 26px;
+    width: auto;
+    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
+      scale(0.8);
+  }
+}
+
+#center {
+  display: flex;
+  flex-direction: column;
+  gap: 25px;
+  place-content: center;
+  place-items: center;
+  flex-grow: 1;
+
+  @media (max-width: 1024px) {
+    padding: 32px 20px 24px;
+    gap: 18px;
+  }
+}
+
+#next-steps {
+  display: flex;
+  border-top: 1px solid var(--border);
+  text-align: left;
+
+  & > div {
+    flex: 1 1 0;
+    padding: 32px;
+    @media (max-width: 1024px) {
+      padding: 24px 20px;
+    }
+  }
+
+  .icon {
+    margin-bottom: 16px;
+    width: 22px;
+    height: 22px;
+  }
+
+  @media (max-width: 1024px) {
+    flex-direction: column;
+    text-align: center;
+  }
+}
+
+#docs {
+  border-right: 1px solid var(--border);
+
+  @media (max-width: 1024px) {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+#next-steps ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 8px;
+  margin: 32px 0 0;
+
+  .logo {
+    height: 18px;
+  }
+
+  a {
+    color: var(--text-h);
+    font-size: 16px;
+    border-radius: 6px;
+    background: var(--social-bg);
+    display: flex;
+    padding: 6px 12px;
+    align-items: center;
+    gap: 8px;
+    text-decoration: none;
+    transition: box-shadow 0.3s;
+
+    &:hover {
+      box-shadow: var(--shadow);
+    }
+    .button-icon {
+      height: 18px;
+      width: 18px;
+    }
+  }
+
+  @media (max-width: 1024px) {
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+
+    li {
+      flex: 1 1 calc(50% - 8px);
+    }
+
+    a {
+      width: 100%;
+      justify-content: center;
+      box-sizing: border-box;
+    }
+  }
+}
+
+#spacer {
+  height: 88px;
+  border-top: 1px solid var(--border);
+  @media (max-width: 1024px) {
+    height: 48px;
+  }
+}
+
+.ticks {
+  position: relative;
+  width: 100%;
+
+  &::before,
+  &::after {
+    content: '';
+    position: absolute;
+    top: -4.5px;
+    border: 5px solid transparent;
+  }
+
+  &::before {
+    left: 0;
+    border-left-color: var(--border);
+  }
+  &::after {
+    right: 0;
+    border-right-color: var(--border);
+  }
+}
+````
+
+## File: frontend/src/index.css
+````css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --text: #6b6375;
+  --text-h: #08060d;
+  --bg: #fff;
+  --border: #e5e4e7;
+  --code-bg: #f4f3ec;
+  --accent: #aa3bff;
+  --accent-bg: rgba(170, 59, 255, 0.1);
+  --accent-border: rgba(170, 59, 255, 0.5);
+  --social-bg: rgba(244, 243, 236, 0.5);
+  --shadow:
+    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
+
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 18px/145% var(--sans);
+  letter-spacing: 0.18px;
+  color-scheme: light dark;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #9ca3af;
+    --text-h: #f3f4f6;
+    --bg: #16171d;
+    --border: #2e303a;
+    --code-bg: #1f2028;
+    --accent: #c084fc;
+    --accent-bg: rgba(192, 132, 252, 0.15);
+    --accent-border: rgba(192, 132, 252, 0.5);
+    --social-bg: rgba(47, 48, 58, 0.5);
+    --shadow:
+      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
+  }
+
+  #social .button-icon {
+    filter: invert(1) brightness(2);
+  }
+}
+
+#root {
+  width: 1126px;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  border-inline: 1px solid var(--border);
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: 56px;
+  letter-spacing: -1.68px;
+  margin: 32px 0;
+  @media (max-width: 1024px) {
+    font-size: 36px;
+    margin: 20px 0;
+  }
+}
+h2 {
+  font-size: 24px;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+p {
+  margin: 0;
+}
+
+code,
+.counter {
+  font-family: var(--mono);
+  display: inline-flex;
+  border-radius: 4px;
+  color: var(--text-h);
+}
+
+code {
+  font-size: 15px;
+  line-height: 135%;
+  padding: 4px 8px;
+  background: var(--code-bg);
+}
+````
+
+## File: frontend/src/main.tsx
+````typescript
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+````
+
+## File: frontend/.oxlintrc.json
+````json
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "oxc"],
+  "rules": {
+    "react/rules-of-hooks": "error",
+    "react/only-export-components": ["warn", { "allowConstantExport": true }]
+  }
+}
+````
+
 ## File: frontend/Dockerfile
 ````dockerfile
 # 1. Этап сборки приложения (Build Stage)
@@ -1033,6 +2904,23 @@ COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]
+````
+
+## File: frontend/index.html
+````html
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>frontend</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
 ````
 
 ## File: frontend/nginx.conf
@@ -1058,6 +2946,135 @@ server {
 }
 ````
 
+## File: frontend/package.json
+````json
+{
+  "name": "frontend",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.104.4",
+    "axios": "^1.20.0",
+    "lucide-react": "^1.59.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-router-dom": "^7.18.4",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "autoprefixer": "^10.6.1",
+    "oxlint": "^1.88.0",
+    "postcss": "^8.5.31",
+    "tailwindcss": "^3.4.19",
+    "typescript": "~7.0.2",
+    "vite": "^8.3.4"
+  }
+}
+````
+
+## File: frontend/postcss.config.js
+````javascript
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+````
+
+## File: frontend/tailwind.config.js
+````javascript
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        bt: {
+          bg: '#0F172A',         // Slate 900
+          card: '#1E293B',       // Slate 800
+          border: '#334155',     // Slate 700
+          amber: '#F59E0B',      // Акцент Warchest / SP
+          green: '#10B981',      // Акцент успеха / Операбелен
+          red: '#EF4444',        // Критические повреждения / Уничтожен
+          blue: '#3B82F6',       // Опыт XP / Пилоты
+        }
+      }
+    },
+  },
+  plugins: [],
+}
+````
+
+## File: frontend/tsconfig.json
+````json
+{
+  "files": [],
+  "references": [
+    { "path": "./tsconfig.app.json" },
+    { "path": "./tsconfig.node.json" }
+  ]
+}
+````
+
+## File: frontend/tsconfig.node.json
+````json
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023"],
+    "types": ["node"],
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "module": "nodenext",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["vite.config.ts"]
+}
+````
+
+## File: frontend/vite.config.ts
+````typescript
+import react from '@vitejs/plugin-react'
+import { defineConfig } from 'vite'
+
+// https://vite.dev/config/
+export default defineConfig({
+  plugins: [react()],
+})
+````
+
+## File: src/chaos_campaign_api/__init__.py
+````python
+def main() -> None:
+    print("Hello from chaos-campaign-api!")
+````
+
 ## File: .dockerignore
 ````
 .venv/
@@ -1071,6 +3088,11 @@ __pycache__/
 node_modules/
 frontend/node_modules/
 frontend/dist/
+````
+
+## File: .python-version
+````
+3.15
 ````
 
 ## File: docker-compose.yml
@@ -1152,6 +3174,15 @@ EXPOSE 8000
 
 # Запуск FastAPI через uvicorn
 CMD ["uv", "run", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+````
+
+## File: pytest.ini
+````ini
+[pytest]
+asyncio_mode = auto
+testpaths = app/tests
+python_files = test_*.py
+pythonpath = .
 ````
 
 ## File: repomix-output.xml
@@ -6626,11 +8657,6 @@ class ForceService:
 </files>
 ````
 
-## File: app/api/v1/endpoints/__init__.py
-````python
-
-````
-
 ## File: app/api/v1/endpoints/auth.py
 ````python
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -6651,12 +8677,6 @@ async def register_user(
     user_in: UserRegister,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Регистрирует нового командира отряда в базе данных.
-    
-    * **201 Created**: Пользователь успешно создан.
-    * **400 Bad Request**: Имя пользователя уже занято.
-    """
     stmt = select(UserModel).where(UserModel.username == user_in.username)
     result = await db.execute(stmt)
     if result.scalar_one_or_none() is not None:
@@ -6670,7 +8690,8 @@ async def register_user(
         hashed_password=get_password_hash(user_in.password)
     )
     db.add(new_user)
-    await db.flush()
+    await db.commit()
+    await db.refresh(new_user)
     return new_user
 
 
@@ -6695,2461 +8716,6 @@ async def login_for_access_token(
 
     access_token = create_access_token(subject=user.id)
     return Token(access_token=access_token, token_type="bearer")
-````
-
-## File: app/api/v1/endpoints/contracts.py
-````python
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.database import get_db
-from app.db.models.force import ForceModel
-from app.db.models.user import UserModel
-from app.dependencies.auth import get_current_user
-from app.dependencies.campaign import verify_force_ownership
-from app.schemas.contract import ContractNegotiationOffer, ContractResponse
-from app.schemas.force import Faction
-from app.services.generator_service import GeneratorService
-from app.services.negotiation_engine import NegotiationEngine
-
-router = APIRouter()
-
-
-@router.get("/available", response_model=List[ContractResponse], summary="Поиск доступных контрактов")
-async def get_available_contracts(
-    employer: Optional[Faction] = Query(None, description="Фильтр по нанимателю"),
-    location: Optional[str] = Query(None, min_length=2, description="Локация Hot Spot"),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(10, ge=1, le=50),
-    current_user: UserModel = Depends(get_current_user)
-):
-    """Возвращает список доступных контрактов с поддержкой фильтрации и пагинации."""
-    # Генерация примеров контрактов для каталога
-    contracts = [
-        GeneratorService.generate_random_contract(
-            employer=employer or Faction.DRACONIS_COMBINE,
-            target_faction=Faction.FEDERATED_SUNS
-        ) for _ in range(limit)
-    ]
-    return contracts
-
-
-@router.post("/{contract_id}/negotiate", summary="Переговоры по условиям контракта")
-async def negotiate_contract(
-    contract_id: str,
-    offer: ContractNegotiationOffer,
-    force_id: str = Query(..., description="ID отряда"),
-    force: ForceModel = Depends(verify_force_ownership)
-):
-    """
-    Проверяет запрашиваемые условия контракта с Очками Репутации отряда.
-    
-    * **400 Bad Request**: Недостаточно репутации (`ReputationRequirementNotMetError`).
-    """
-    mock_contract = GeneratorService.generate_random_contract()
-    mock_contract.id = contract_id
-
-    NegotiationEngine.validate_negotiation_offer(
-        force=force, contract=mock_contract, requested_terms=offer.requested_terms
-    )
-    mock_contract.terms = offer.requested_terms
-    return {"status": "terms_accepted", "contract": mock_contract}
-
-
-@router.post("/{contract_id}/sign", summary="Подписание контракта")
-async def sign_contract(
-    contract_id: str,
-    force_id: str = Query(...),
-    force: ForceModel = Depends(verify_force_ownership)
-):
-    """Подписывает контракт и закрепляет его за отрядом."""
-    return {"status": "contract_signed", "contract_id": contract_id, "force_id": force.id}
-````
-
-## File: app/api/v1/endpoints/generator.py
-````python
-from fastapi import APIRouter, Depends
-from app.schemas.contract import ContractResponse
-from app.schemas.generator import ContractGenerateRequest
-from app.services.generator_service import GeneratorService
-
-router = APIRouter()
-
-
-@router.post("/contract", response_model=ContractResponse, summary="Процедурная генерация контракта")
-async def generate_contract(request: ContractGenerateRequest):
-    """Создает случайный контракт по правилам книги Hot Spots."""
-    return GeneratorService.generate_random_contract(
-        employer=request.employer,
-        target_faction=request.target_faction
-    )
-````
-
-## File: app/api/v1/endpoints/logistics.py
-````python
-import random
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.database import get_db
-from app.db.models.force import ForceModel
-from app.dependencies.campaign import verify_force_ownership
-from app.schemas.force import Faction, WeightClass
-from app.schemas.logistics import PurchaseUnitRequest, RepairRequest, ScrapUnitRequest
-from app.services.logistics_service import LogisticsService
-
-router = APIRouter()
-
-
-@router.post("/repair", summary="Ремонт техники за SP")
-async def repair_unit(
-    request: RepairRequest,
-    sp_cost: int = Query(50, ge=0),
-    force_id: str = Query(...),
-    force: ForceModel = Depends(verify_force_ownership),
-    db: AsyncSession = Depends(get_db)
-):
-    """Восстанавливает поврежденный мех до статуса OPERATIONAL за SP."""
-    try:
-        repaired_unit = await LogisticsService.repair_unit(
-            db=db, force=force, unit_id=request.unit_id, sp_cost=sp_cost
-        )
-        return {"status": "repaired", "unit_id": repaired_unit.id, "remaining_sp": force.support_points}
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-
-@router.post("/scrap", summary="Утилизация уничтоженной техники на лом")
-async def scrap_unit(
-    request: ScrapUnitRequest,
-    force_id: str = Query(...),
-    force: ForceModel = Depends(verify_force_ownership),
-    db: AsyncSession = Depends(get_db)
-):
-    """Списывает полностью уничтоженный мех (TRULY_DESTROYED) и зачисляет 25% стоимости в SP."""
-    try:
-        sp_yield = await LogisticsService.scrap_unit(db=db, force=force, unit_id=request.unit_id)
-        return {"status": "scrapped", "sp_earned": sp_yield, "total_sp": force.support_points}
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-
-@router.post("/buy-unit", summary="Покупка новой техники")
-async def buy_unit(
-    request: PurchaseUnitRequest,
-    force_id: str = Query(...),
-    force: ForceModel = Depends(verify_force_ownership),
-    db: AsyncSession = Depends(get_db)
-):
-    """Приобретает новый мех и привязывает его к ростеру отряда."""
-    try:
-        new_unit = await LogisticsService.buy_unit(db=db, force=force, request=request)
-        return {"status": "purchased", "unit": new_unit, "remaining_sp": force.support_points}
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-
-@router.get("/rat-roll", summary="Ролл по таблицам RAT (Random Assignment Tables)")
-async def rat_roll(
-    faction: Faction = Query(...),
-    weight_class: WeightClass = Query(...),
-    unit_rating: str = Query("Scale 1", pattern=r"^Scale [1-3]$")
-):
-    """Генерирует случайный мех по таблицам RAT региона Draconis Reach."""
-    sample_mechs = {
-        WeightClass.LIGHT: [("Panther", "PTH-9R"), ("Jenner", "JR7-D"), ("Locust", "LCT-1E")],
-        WeightClass.MEDIUM: [("Starslayer", "STAGE-3C"), ("Phoenix Hawk", "PXH-1K"), ("Centurion", "CN9-A")],
-        WeightClass.HEAVY: [("Dragon", "DRG-1N"), ("Catapult", "CPLT-C1"), ("Grasshopper", "GHR-5H")],
-        WeightClass.ASSAULT: [("Awesome", "AWS-8Q"), ("BattleMaster", "BLR-1D"), ("Stalker", "STK-3H")],
-    }
-    chassis, model = random.choice(sample_mechs[weight_class])
-    return {
-        "faction": faction,
-        "weight_class": weight_class,
-        "unit_rating": unit_rating,
-        "rolled_mech": {"chassis": chassis, "model": model}
-    }
-````
-
-## File: app/api/v1/endpoints/pilots.py
-````python
-from fastapi import APIRouter, Depends, HTTPException, Path, status
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.database import get_db
-from app.db.models.pilot import PilotModel
-from app.db.models.user import UserModel
-from app.dependencies.auth import get_current_user
-from app.schemas.pilot import NamedPilot, PilotUpgradeRequest
-from app.services.pilot_service import PilotService
-
-router = APIRouter()
-
-
-@router.get("/{pilot_id}", response_model=NamedPilot, summary="Информация о пилоте")
-async def get_pilot(
-    pilot_id: str = Path(..., description="UUID пилота"),
-    db: AsyncSession = Depends(get_db),
-    current_user: UserModel = Depends(get_current_user)
-):
-    """Возвращает карточку пилота из СУБД."""
-    stmt = select(PilotModel).where(PilotModel.id == pilot_id)
-    res = await db.execute(stmt)
-    pilot = res.scalar_one_or_none()
-    if not pilot:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пилот не найден")
-    return pilot
-
-
-@router.post("/{pilot_id}/upgrade", response_model=NamedPilot, summary="Прокачка пилота за XP")
-async def upgrade_pilot(
-    request: PilotUpgradeRequest,
-    pilot_id: str = Path(..., description="UUID пилота"),
-    db: AsyncSession = Depends(get_db),
-    current_user: UserModel = Depends(get_current_user)
-):
-    """
-    Транзакционно улучшает навык Gunnery/Piloting, добавляет Edge или покупает SPA за XP.
-    
-    * **400 Bad Request**: Недостаточно XP (`InsufficientXPError`) или достигнут предел.
-    """
-    stmt = select(PilotModel).where(PilotModel.id == pilot_id)
-    res = await db.execute(stmt)
-    pilot = res.scalar_one_or_none()
-    if not pilot:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пилот не найден")
-
-    try:
-        return await PilotService.upgrade_pilot(db=db, pilot=pilot, request=request)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-````
-
-## File: app/api/v1/__init__.py
-````python
-
-````
-
-## File: app/api/v1/api.py
-````python
-from fastapi import APIRouter
-from app.api.v1.endpoints import auth, contracts, forces, generator, logistics, pilots, tracks
-
-api_router = APIRouter()
-
-api_router.include_router(auth.router, prefix="/auth", tags=["Auth"])
-api_router.include_router(forces.router, prefix="/forces", tags=["Forces"])
-api_router.include_router(pilots.router, prefix="/pilots", tags=["Pilots"])
-api_router.include_router(contracts.router, prefix="/contracts", tags=["Contracts"])
-api_router.include_router(tracks.router, prefix="/tracks", tags=["Tracks"])
-api_router.include_router(logistics.router, prefix="/logistics", tags=["Logistics"])
-api_router.include_router(generator.router, prefix="/generator", tags=["Generator"])
-````
-
-## File: app/api/__init__.py
-````python
-
-````
-
-## File: app/core/__init__.py
-````python
-
-````
-
-## File: app/core/security.py
-````python
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Union
-import bcrypt
-import jwt
-from app.config import settings
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Проверяет соответствие открытого пароля сохраненному хэшу."""
-    password_bytes = plain_password.encode("utf-8")[:72]
-    hashed_bytes = hashed_password.encode("utf-8")
-    return bcrypt.checkpw(password_bytes, hashed_bytes)
-
-
-def get_password_hash(password: str) -> str:
-    """Генерирует хэш bcrypt для пароля с обрезкой до 72 байт."""
-    password_bytes = password.encode("utf-8")[:72]
-    salt = bcrypt.gensalt()
-    return bcrypt.hashpw(password_bytes, salt).decode("utf-8")
-
-
-def create_access_token(
-    subject: Union[str, Any], expires_delta: Optional[timedelta] = None
-) -> str:
-    """Создает подписанный JWT токен доступа."""
-    if expires_delta:
-        expire = datetime.now(timezone.utc) + expires_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
-
-    to_encode = {
-        "exp": expire,
-        "sub": str(subject),
-        "commander_id": str(subject),
-    }
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-````
-
-## File: app/db/models/__init__.py
-````python
-from app.db.models.user import UserModel
-from app.db.models.force import ForceModel, MechUnitModel
-from app.db.models.pilot import PilotModel
-
-__all__ = ["UserModel", "ForceModel", "MechUnitModel", "PilotModel"]
-````
-
-## File: app/db/__init__.py
-````python
-
-````
-
-## File: app/db/database.py
-````python
-from typing import AsyncGenerator
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.orm import DeclarativeBase
-from app.config import settings
-
-# Асинхронный движок SQLAlchemy
-engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=False,
-    future=True,
-    pool_pre_ping=True
-)
-
-# Фабрика асинхронных сессий
-AsyncSessionLocal = async_sessionmaker(
-    bind=engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autoflush=False
-)
-
-
-class Base(DeclarativeBase):
-    """Базовый декларативный класс для всех моделей СУБД."""
-    pass
-
-
-async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    """
-    FastAPI Dependency для инъекции асинхронной сессии базы данных.
-    Автоматически фиксирует транзакцию при успехе или откатывает при ошибке.
-    """
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
-````
-
-## File: app/dependencies/__init__.py
-````python
-
-````
-
-## File: app/dependencies/auth.py
-````python
-import jwt
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.config import settings
-from app.db.database import get_db
-from app.db.models.user import UserModel
-from app.schemas.auth import TokenData
-
-oauth2_scheme = OAuth2PasswordBearer(
-    tokenUrl=f"{settings.API_V1_STR}/auth/token"
-)
-
-
-async def get_current_user(
-    token: str = Depends(oauth2_scheme),
-    db: AsyncSession = Depends(get_db)
-) -> UserModel:
-    """Извлекает и валидирует текущего пользователя из JWT токена."""
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Не удалось валидировать учетные данные",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-    
-    try:
-        payload = jwt.decode(
-            token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM]
-        )
-        commander_id: str = payload.get("sub") or payload.get("commander_id")
-        if commander_id is None:
-            raise credentials_exception
-        token_data = TokenData(commander_id=commander_id)
-    except jwt.PyJWTError:
-        raise credentials_exception
-
-    stmt = select(UserModel).where(UserModel.id == token_data.commander_id)
-    result = await db.execute(stmt)
-    user = result.scalar_one_or_none()
-
-    if user is None:
-        raise credentials_exception
-    if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail="Пользователь неактивен"
-        )
-
-    return user
-````
-
-## File: app/dependencies/campaign.py
-````python
-from fastapi import Depends, HTTPException, status
-from sqlalchemy import select
-from sqlalchemy.orm import selectinload
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.db.database import get_db
-from app.db.models.force import ForceModel
-from app.db.models.user import UserModel
-from app.dependencies.auth import get_current_user
-
-
-async def verify_force_ownership(
-    force_id: str,
-    current_user: UserModel = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-) -> ForceModel:
-    """Проверяет существование отряда в СУБД и права доступа текущего пользователя."""
-    stmt = (
-        select(ForceModel)
-        .where(ForceModel.id == force_id)
-        .options(
-            selectinload(ForceModel.units),
-            selectinload(ForceModel.pilots)
-        )
-    )
-    result = await db.execute(stmt)
-    force = result.scalar_one_or_none()
-
-    if force is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Отряд с ID '{force_id}' не найден"
-        )
-
-    if force.owner_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="У вас нет прав для управления этим отрядом"
-        )
-
-    return force
-````
-
-## File: app/dependencies/db.py
-````python
-from app.db.database import get_db
-
-__all__ = ["get_db"]
-````
-
-## File: app/schemas/__init__.py
-````python
-from app.schemas.auth import Token, TokenData, UserLogin, UserRegister, UserResponse
-from app.schemas.pilot import NamedPilot, SkillUpgrade, EdgeUpgrade, AbilityUpgrade, PilotUpgradeRequest
-from app.schemas.force import Faction, UnitStatus, WeightClass, MechUnit, ForceCreate, ForceResponse, AssignPilotRequest
-from app.schemas.contract import CommandRights, SalvageRights, ContractTerms, ContractNegotiationOffer, ContractResponse
-from app.schemas.track import PilotTrackPerformance, TrackCompletionRequest, XPAllocationResult, TrackCompletionResponse
-from app.schemas.logistics import RepairRequest, ScrapUnitRequest, PurchaseUnitRequest, RATRollQuery
-from app.schemas.generator import ContractGenerateRequest
-
-__all__ = [
-    "Token", "TokenData", "UserLogin", "UserRegister", "UserResponse",
-    "NamedPilot", "SkillUpgrade", "EdgeUpgrade", "AbilityUpgrade", "PilotUpgradeRequest",
-    "Faction", "UnitStatus", "WeightClass", "MechUnit", "ForceCreate", "ForceResponse", "AssignPilotRequest",
-    "CommandRights", "SalvageRights", "ContractTerms", "ContractNegotiationOffer", "ContractResponse",
-    "PilotTrackPerformance", "TrackCompletionRequest", "XPAllocationResult", "TrackCompletionResponse",
-    "RepairRequest", "ScrapUnitRequest", "PurchaseUnitRequest", "RATRollQuery",
-    "ContractGenerateRequest",
-]
-````
-
-## File: app/schemas/auth.py
-````python
-from typing import Optional
-from pydantic import BaseModel, Field, ConfigDict
-
-
-class Token(BaseModel):
-    """Ответ API с JWT токеном доступа."""
-    access_token: str = Field(..., description="JWT токен доступа")
-    token_type: str = Field(default="bearer", description="Тип токена")
-
-
-class TokenData(BaseModel):
-    """Данные, зашифрованные внутри JWT токена."""
-    commander_id: Optional[str] = Field(None, description="UUID командира в БД")
-
-
-class UserLogin(BaseModel):
-    """Схема входа пользователя."""
-    username: str = Field(..., min_length=3, max_length=50, json_schema_extra={"example": "commander_vance"})
-    password: str = Field(..., min_length=4, json_schema_extra={"example": "strongpassword123"})
-
-
-class UserRegister(BaseModel):
-    """Схема регистрации нового командира в СУБД."""
-    username: str = Field(..., min_length=3, max_length=50, json_schema_extra={"example": "commander_vance"})
-    password: str = Field(..., min_length=6, json_schema_extra={"example": "strongpassword123"})
-
-
-class UserResponse(BaseModel):
-    """Публичные данные пользователя."""
-    id: str = Field(..., description="Уникальный UUID пользователя в БД")
-    username: str
-    is_active: bool = True
-
-    model_config = ConfigDict(from_attributes=True)
-````
-
-## File: app/schemas/generator.py
-````python
-from typing import Optional
-from pydantic import BaseModel, Field
-from app.schemas.force import Faction
-
-
-class ContractGenerateRequest(BaseModel):
-    """Параметры процедуры генерации случайного контракта."""
-    employer: Optional[Faction] = Field(None, description="Целевой наниматель")
-    target_faction: Optional[Faction] = Field(None, description="Вражеская фракция")
-    location_hot_spot: Optional[str] = Field(None, description="Локация в Draconis Reach")
-````
-
-## File: app/schemas/logistics.py
-````python
-from pydantic import BaseModel, Field
-from app.schemas.force import Faction, WeightClass
-
-
-class RepairRequest(BaseModel):
-    """Запрос на ремонт поврежденной техники за SP."""
-    unit_id: str = Field(..., description="ID поврежденного меха")
-
-
-class ScrapUnitRequest(BaseModel):
-    """Запрос на утилизацию уничтоженной техники (TRULY_DESTROYED) на лом."""
-    unit_id: str = Field(..., description="ID техники для утилизации в SP в БД")
-
-
-class PurchaseUnitRequest(BaseModel):
-    """Запрос на покупку новой единицы техники."""
-    chassis: str = Field(..., json_schema_extra={"example": "Catapult"})
-    model: str = Field(..., json_schema_extra={"example": "CPLT-C1"})
-    tonnage: int = Field(..., ge=20, le=100, json_schema_extra={"example": 65})
-    weight_class: WeightClass = Field(..., json_schema_extra={"example": WeightClass.HEAVY})
-    bv2: int = Field(..., ge=100, le=5000, json_schema_extra={"example": 1399})
-    cost_sp: int = Field(..., ge=0, json_schema_extra={"example": 300})
-
-
-class RATRollQuery(BaseModel):
-    """Параметры генерации случайной техники по RAT-таблицам."""
-    faction: Faction
-    unit_rating: str = Field(..., pattern=r"^Scale [1-3]$", description="Рейтинг подразделения (Scale 1, Scale 2, Scale 3)")
-    weight_class: WeightClass
-````
-
-## File: app/schemas/pilot.py
-````python
-from typing import Annotated, List, Literal, Union, Optional
-from pydantic import BaseModel, Field, ConfigDict
-
-
-class NamedPilot(BaseModel):
-    """Модель именного пилота отряда наемников."""
-    id: str = Field(..., description="Уникальный UUID пилота в БД")
-    force_id: Optional[str] = Field(None, description="ID отряда в БД")
-    name: str = Field(..., min_length=2, max_length=50, json_schema_extra={"example": "Maverick Banderas"})
-    gunnery: int = Field(default=4, ge=0, le=8, description="Навык стрельбы (чем ниже, тем лучше)")
-    piloting: int = Field(default=5, ge=0, le=8, description="Навык пилотирования (чем ниже, тем лучше)")
-    
-    # Система опыта (XP)
-    experience_points: int = Field(default=0, ge=0, description="Доступные очки опыта (XP)")
-    total_xp_earned: int = Field(default=0, ge=0, description="Всего заработано XP за кампанию")
-    
-    # Способности и Edge
-    edge_points: int = Field(default=1, ge=0, le=10, description="Текущее значение Edge (0-10)")
-    special_abilities: List[str] = Field(
-        default_factory=list, 
-        json_schema_extra={"example": ["Overcharge", "Dodge", "Marksman"]},
-        description="Купленные спец-способности (SPAs) и способности Edge"
-    )
-    is_temporary_hire: bool = Field(default=False)
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-# --- Discriminated Unions для полиморфных запросов на улучшение пилота ---
-
-class SkillUpgrade(BaseModel):
-    """Улучшение навыка стрельбы или пилотирования."""
-    upgrade_type: Literal["gunnery", "piloting"]
-
-
-class EdgeUpgrade(BaseModel):
-    """Покупка дополнительного очка Edge."""
-    upgrade_type: Literal["edge"]
-
-
-class AbilityUpgrade(BaseModel):
-    """Покупка специальной способности (SPA)."""
-    upgrade_type: Literal["ability"]
-    ability_name: str = Field(..., min_length=2, description="Название спец-способности (SPA)")
-
-
-PilotUpgradeRequest = Annotated[
-    Union[SkillUpgrade, EdgeUpgrade, AbilityUpgrade], 
-    Field(discriminator="upgrade_type")
-]
-````
-
-## File: app/services/__init__.py
-````python
-from app.services.pilot_service import PilotService
-from app.services.negotiation_engine import NegotiationEngine
-from app.services.force_service import ForceService
-from app.services.track_service import TrackService
-from app.services.logistics_service import LogisticsService
-from app.services.generator_service import GeneratorService
-
-__all__ = [
-    "PilotService",
-    "NegotiationEngine",
-    "ForceService",
-    "TrackService",
-    "LogisticsService",
-    "GeneratorService",
-]
-````
-
-## File: app/services/logistics_service.py
-````python
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from app.db.models.force import ForceModel, MechUnitModel
-from app.schemas.force import UnitStatus
-from app.schemas.logistics import PurchaseUnitRequest
-
-
-class LogisticsService:
-    @staticmethod
-    async def repair_unit(db: AsyncSession, force: ForceModel, unit_id: str, sp_cost: int) -> MechUnitModel:
-        """Ремонтирует поврежденный мех за SP, возвращая ему статус OPERATIONAL."""
-        if force.support_points < sp_cost:
-            raise ValueError(f"Недостаточно SP для ремонта. Требуется: {sp_cost}, доступно: {force.support_points}")
-
-        stmt = select(MechUnitModel).where(MechUnitModel.id == unit_id, MechUnitModel.force_id == force.id)
-        res = await db.execute(stmt)
-        unit = res.scalar_one_or_none()
-
-        if not unit:
-            raise ValueError("Техника не найдена в отряде")
-
-        force.support_points -= sp_cost
-        unit.status = UnitStatus.OPERATIONAL
-        db.add_all([force, unit])
-        await db.flush()
-        return unit
-
-    @staticmethod
-    async def scrap_unit(db: AsyncSession, force: ForceModel, unit_id: str) -> int:
-        """
-        Утилизирует уничтоженный мех (TRULY_DESTROYED) на лом.
-        Зачисляет 25% его базовой стоимости в SP и удаляет объект из БД.
-        """
-        stmt = select(MechUnitModel).where(MechUnitModel.id == unit_id, MechUnitModel.force_id == force.id)
-        res = await db.execute(stmt)
-        unit = res.scalar_one_or_none()
-
-        if not unit:
-            raise ValueError("Техника не найдена в отряде")
-        if unit.status != UnitStatus.TRULY_DESTROYED:
-            raise ValueError("На лом можно распилить только полностью уничтоженную технику (TRULY_DESTROYED)")
-
-        # Расчет 25% стоимости от тоннажа/BV2 в SP
-        sp_yield = int((unit.tonnage * 10) * 0.25)
-        force.support_points += sp_yield
-
-        await db.delete(unit)
-        db.add(force)
-        await db.flush()
-        return sp_yield
-
-    @staticmethod
-    async def buy_unit(db: AsyncSession, force: ForceModel, request: PurchaseUnitRequest) -> MechUnitModel:
-        """Покупка новой техники за SP."""
-        if force.support_points < request.cost_sp:
-            raise ValueError(f"Недостаточно SP для покупки. Требуется: {request.cost_sp}, доступно: {force.support_points}")
-
-        force.support_points -= request.cost_sp
-        new_unit = MechUnitModel(
-            force_id=force.id,
-            chassis=request.chassis,
-            model=request.model,
-            tonnage=request.tonnage,
-            weight_class=request.weight_class,
-            bv2=request.bv2,
-            status=UnitStatus.OPERATIONAL
-        )
-        db.add_all([force, new_unit])
-        await db.flush()
-        return new_unit
-````
-
-## File: app/services/pilot_service.py
-````python
-from typing import List
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.attributes import flag_modified
-from app.core.exceptions import InsufficientXPError
-from app.db.models.pilot import PilotModel
-from app.schemas.pilot import (
-    AbilityUpgrade,
-    EdgeUpgrade,
-    PilotUpgradeRequest,
-    SkillUpgrade,
-)
-
-# Нелинейные таблицы стоимости прокачки пилотов (в XP) согласно спецификации v3.0
-GUNNERY_UPGRADE_COSTS = {4: 300, 3: 700, 2: 1200, 1: 2200}
-PILOTING_UPGRADE_COSTS = {5: 100, 4: 200, 3: 700, 2: 1200}
-EDGE_UPGRADE_COSTS = {
-    1: 60, 2: 120, 3: 200, 4: 300, 5: 420,
-    6: 560, 7: 720, 8: 900, 9: 1100
-}
-SPA_COST_TABLE = [60, 180, 360, 600, 900]
-
-
-class PilotService:
-    @staticmethod
-    async def upgrade_pilot(
-        db: AsyncSession, 
-        pilot: PilotModel, 
-        request: PilotUpgradeRequest
-    ) -> PilotModel:
-        """
-        Прокачивает характеристики пилота за XP в рамках асинхронной транзакции БД.
-        
-        :raises InsufficientXPError: Если у пилота недостаточно experience_points.
-        :raises ValueError: Если достигнут лимит развития параметра.
-        """
-        if isinstance(request, SkillUpgrade):
-            if request.upgrade_type == "gunnery":
-                cost = GUNNERY_UPGRADE_COSTS.get(pilot.gunnery)
-                if cost is None:
-                    raise ValueError("Достигнут максимальный навык Gunnery (0)")
-                if pilot.experience_points < cost:
-                    raise InsufficientXPError(required=cost, available=pilot.experience_points)
-                pilot.experience_points -= cost
-                pilot.gunnery -= 1
-
-            elif request.upgrade_type == "piloting":
-                cost = PILOTING_UPGRADE_COSTS.get(pilot.piloting)
-                if cost is None:
-                    raise ValueError("Достигнут максимальный навык Piloting (1)")
-                if pilot.experience_points < cost:
-                    raise InsufficientXPError(required=cost, available=pilot.experience_points)
-                pilot.experience_points -= cost
-                pilot.piloting -= 1
-
-        elif isinstance(request, EdgeUpgrade):
-            cost = EDGE_UPGRADE_COSTS.get(pilot.edge_points)
-            if cost is None:
-                raise ValueError("Достигнуто максимальное значение Edge (10)")
-            if pilot.experience_points < cost:
-                raise InsufficientXPError(required=cost, available=pilot.experience_points)
-            pilot.experience_points -= cost
-            pilot.edge_points += 1
-
-        elif isinstance(request, AbilityUpgrade):
-            ability_name = request.ability_name.strip()
-            if not ability_name:
-                raise ValueError("Название способности не может быть пустым")
-
-            current_abilities = list(getattr(pilot, "special_abilities", []) or [])
-            if len(current_abilities) >= 5:
-                raise ValueError("Достигнут лимит в 5 специальных способностей")
-
-            if ability_name in current_abilities:
-                raise ValueError("Эта способность уже изучена пилотом")
-
-            ability_index = min(len(current_abilities), len(SPA_COST_TABLE) - 1)
-            cost = SPA_COST_TABLE[ability_index]
-
-            if pilot.experience_points < cost:
-                raise InsufficientXPError(required=cost, available=pilot.experience_points)
-
-            pilot.experience_points -= cost
-            current_abilities.append(ability_name)
-            pilot.special_abilities = current_abilities
-            flag_modified(pilot, "special_abilities")
-
-        db.add(pilot)
-        await db.commit()
-        await db.refresh(pilot)
-        return pilot
-````
-
-## File: app/tests/__init__.py
-````python
-
-````
-
-## File: app/tests/test_force.py
-````python
-import pytest
-from httpx import AsyncClient
-from app.config import settings
-
-
-async def test_create_force_v6_success(client: AsyncClient, auth_headers: dict):
-    payload = {
-        "name": "Iron Hand Mercenaries",
-        "sponsoring_faction": "Draconis Combine",
-        "starting_pilot_names": ["Kenshin", "Saito"],
-        "selected_mechs": [
-            {"chassis": "Panther", "model": "PNT-9R", "tonnage": 35, "weight_class": "Light", "bv2": 769},
-            {"chassis": "Dragon", "model": "DRG-1N", "tonnage": 60, "weight_class": "Heavy", "bv2": 1125}
-        ]
-    }
-
-    response = await client.post(f"{settings.API_V1_STR}/forces/", json=payload, headers=auth_headers)
-
-    assert response.status_code == 201
-    data = response.json()
-    assert data["support_points"] == 3000
-    assert data["reputation_score"] == 1
-    assert len(data["pilots"]) == 2
-    assert data["pilots"][0]["experience_points"] == 150
-    assert len(data["units"]) == 2
-
-
-async def test_create_force_v6_exceed_bv2_limit(client: AsyncClient, auth_headers: dict):
-    payload = {
-        "name": "Heavy Assault Mercs",
-        "sponsoring_faction": "Draconis Combine",
-        "starting_pilot_names": ["Pilot A", "Pilot B"],
-        "selected_mechs": [
-            {"chassis": "Atlas", "model": "AS7-D", "tonnage": 100, "weight_class": "Assault", "bv2": 1897},
-            {"chassis": "Awesome", "model": "AWS-8Q", "tonnage": 80, "weight_class": "Assault", "bv2": 1605}
-        ]  # Итого: 3502 BV2 > 3000 BV2
-    }
-
-    response = await client.post(f"{settings.API_V1_STR}/forces/", json=payload, headers=auth_headers)
-
-    assert response.status_code == 422
-````
-
-## File: app/__init__.py
-````python
-
-````
-
-## File: frontend/src/api/client.ts
-````typescript
-import axios from 'axios';
-import { useAuthStore } from '../store/authStore';
-
-export const apiClient = axios.create({
-  baseURL: import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1',
-  headers: {
-    'Content-Type': 'application/json',
-  },
-});
-
-apiClient.interceptors.request.use((config) => {
-  const token = useAuthStore.getState().token;
-  if (token && config.headers) {
-    config.headers.Authorization = `Bearer ${token}`;
-  }
-  return config;
-});
-
-apiClient.interceptors.response.use(
-  (response) => response,
-  (error) => {
-    if (error.response?.status === 401) {
-      useAuthStore.getState().logout();
-    }
-    return Promise.reject(error);
-  }
-);
-````
-
-## File: frontend/src/components/common/ProtectedRoute.tsx
-````typescript
-import React from 'react';
-import { Navigate, Outlet } from 'react-router-dom';
-import { useAuthStore } from '../../store/authStore';
-
-export const ProtectedRoute: React.FC = () => {
-  const isAuthenticated = useAuthStore((state) => state.isAuthenticated);
-
-  if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
-  }
-
-  return <Outlet />;
-};
-````
-
-## File: frontend/src/components/domain/MechStatusBadge.tsx
-````typescript
-import React from 'react';
-import { UnitStatus } from '../../types';
-
-interface MechStatusBadgeProps {
-  status: UnitStatus;
-}
-
-export const MechStatusBadge: React.FC<MechStatusBadgeProps> = ({ status }) => {
-  switch (status) {
-    case UnitStatus.OPERATIONAL:
-      return (
-        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-emerald-950/80 text-emerald-400 border border-emerald-500/40">
-          Боеспособен
-        </span>
-      );
-    case UnitStatus.DAMAGED:
-      return (
-        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-amber-950/80 text-amber-400 border border-amber-500/40">
-          Поврежден
-        </span>
-      );
-    case UnitStatus.DESTROYED:
-      return (
-        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-orange-950/80 text-orange-400 border border-orange-500/40">
-          Уничтожен
-        </span>
-      );
-    case UnitStatus.TRULY_DESTROYED:
-      return (
-        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-red-950/80 text-red-400 border border-red-500/40 animate-pulse">
-          Полный лом
-        </span>
-      );
-    default:
-      return (
-        <span className="px-2.5 py-1 rounded text-xs font-bold uppercase bg-slate-800 text-slate-400">
-          {status}
-        </span>
-      );
-  }
-};
-````
-
-## File: frontend/src/pages/Auth/LoginPage.tsx
-````typescript
-import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import { useAuthStore } from '../../store/authStore';
-import { authApi } from '../../api/services';
-import { Shield, Lock, User as UserIcon } from 'lucide-react';
-
-export const LoginPage: React.FC = () => {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-
-  const setToken = useAuthStore((state) => state.setToken);
-  const navigate = useNavigate();
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setIsLoading(true);
-
-    try {
-      const formData = new FormData();
-      formData.append('username', username);
-      formData.append('password', password);
-
-      const res = await authApi.login(formData);
-      setToken(res.data.access_token);
-      navigate('/');
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка авторизации');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  return (
-    <div className="min-h-screen bg-bt-bg flex items-center justify-center p-4">
-      <div className="w-full max-w-md bg-bt-card border border-bt-border rounded-lg p-6 shadow-xl">
-        <div className="flex items-center justify-center gap-3 mb-6">
-          <Shield className="w-8 h-8 text-bt-amber" />
-          <h1 className="text-xl font-bold text-white tracking-wide">
-            DRCM TERMINAL <span className="text-bt-amber text-xs">v0.2</span>
-          </h1>
-        </div>
-
-        {error && (
-          <div className="mb-4 p-3 bg-red-900/50 border border-bt-red text-red-200 text-sm rounded">
-            {error}
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
-              Позывной Командира
-            </label>
-            <div className="relative">
-              <UserIcon className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
-              <input
-                type="text"
-                required
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
-                placeholder="Commander"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
-              Пароль
-            </label>
-            <div className="relative">
-              <Lock className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
-                placeholder="••••••••"
-              />
-            </div>
-          </div>
-
-          <button
-            type="submit"
-            disabled={isLoading}
-            className="w-full bg-bt-amber hover:bg-amber-600 text-slate-950 font-bold py-2 px-4 rounded transition-colors disabled:opacity-50"
-          >
-            {isLoading ? 'Подключение...' : 'Вход в терминал'}
-          </button>
-        </form>
-
-        <p className="mt-4 text-center text-sm text-slate-400">
-          Нет аккаунта?{' '}
-          <Link to="/register" className="text-bt-amber hover:underline">
-            Зарегистрировать отряд
-          </Link>
-        </p>
-      </div>
-    </div>
-  );
-};
-````
-
-## File: frontend/src/pages/Auth/RegisterPage.tsx
-````typescript
-import React, { useState } from 'react';
-import { useNavigate, Link } from 'react-router-dom';
-import { authApi } from '../../api/services';
-import { Shield, Lock, User as UserIcon } from 'lucide-react';
-
-export const RegisterPage: React.FC = () => {
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
-  const [isLoading, setIsLoading] = useState(false);
-
-  const navigate = useNavigate();
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setError(null);
-    setIsLoading(true);
-
-    try {
-      await authApi.register({ username, password });
-      navigate('/login');
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка регистрации');
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  return (
-    <div className="min-h-screen bg-bt-bg flex items-center justify-center p-4">
-      <div className="w-full max-w-md bg-bt-card border border-bt-border rounded-lg p-6 shadow-xl">
-        <div className="flex items-center justify-center gap-3 mb-6">
-          <Shield className="w-8 h-8 text-bt-amber" />
-          <h1 className="text-xl font-bold text-white tracking-wide">
-            РЕГИСТРАЦИЯ КОМАНДИРА
-          </h1>
-        </div>
-
-        {error && (
-          <div className="mb-4 p-3 bg-red-900/50 border border-bt-red text-red-200 text-sm rounded">
-            {error}
-          </div>
-        )}
-
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div>
-            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
-              Имя пользователя / Позывной
-            </label>
-            <div className="relative">
-              <UserIcon className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
-              <input
-                type="text"
-                required
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
-                placeholder="Commander"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
-              Пароль
-            </label>
-            <div className="relative">
-              <Lock className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
-              <input
-                type="password"
-                required
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
-                placeholder="••••••••"
-              />
-            </div>
-          </div>
-
-          <button
-            type="submit"
-            disabled={isLoading}
-            className="w-full bg-bt-amber hover:bg-amber-600 text-slate-950 font-bold py-2 px-4 rounded transition-colors disabled:opacity-50"
-          >
-            {isLoading ? 'Создание записи...' : 'Создать учетную запись'}
-          </button>
-        </form>
-
-        <p className="mt-4 text-center text-sm text-slate-400">
-          Уже зарегистрированы?{' '}
-          <Link to="/login" className="text-bt-amber hover:underline">
-            Войти
-          </Link>
-        </p>
-      </div>
-    </div>
-  );
-};
-````
-
-## File: frontend/src/pages/ForceSelection/ForceSelectionPage.tsx
-````typescript
-import React, { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { forcesApi } from '../../api/services';
-import { useAuthStore } from '../../store/authStore';
-import { 
-  Shield, 
-  PlusCircle, 
-  Coins, 
-  Award, 
-  Crosshair, 
-  Users, 
-  ArrowRight, 
-  LogOut,
-  Trash2
-} from 'lucide-react';
-
-export const ForceSelectionPage: React.FC = () => {
-  const navigate = useNavigate();
-  const queryClient = useQueryClient();
-  const logout = useAuthStore((state) => state.logout);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-
-  const { data: forces, isLoading, error } = useQuery({
-    queryKey: ['my-forces'],
-    queryFn: () => forcesApi.getMyForces(),
-  });
-
-  // Мутация удаления отряда
-  const deleteMutation = useMutation({
-    mutationFn: (forceId: string) => forcesApi.deleteForce(forceId),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['my-forces'] });
-      setDeletingId(null);
-    },
-    onError: (err) => {
-      console.error("Ошибка при удалении отряда:", err);
-      alert("Не удалось удалить отряд. Попробуйте еще раз.");
-      setDeletingId(null);
-    }
-  });
-
-  const handleDelete = (e: React.MouseEvent, forceId: string, forceName: string) => {
-    e.stopPropagation(); // Предотвращаем переход на страницу отряда при клике на корзину
-    if (window.confirm(`Вы уверены, что хотите расформировать отряд "${forceName}"? Вся техника и пилоты будут удалены из базы данных.`)) {
-      setDeletingId(forceId);
-      deleteMutation.mutate(forceId);
-    }
-  };
-
-  if (isLoading) {
-    return (
-      <div className="min-h-screen bg-bt-bg text-white flex items-center justify-center font-mono">
-        <p className="text-bt-amber animate-pulse">Загрузка реестра ваших отрядов...</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-bt-bg text-white p-6 flex flex-col items-center">
-      <div className="w-full max-w-6xl">
-        {/* Шапка */}
-        <div className="flex justify-between items-center mb-8 border-b border-bt-border pb-4">
-          <div className="flex items-center gap-3">
-            <Shield className="w-8 h-8 text-bt-amber" />
-            <div>
-              <h1 className="text-2xl font-bold tracking-wider uppercase text-white">
-                Командный Штаб
-              </h1>
-              <p className="text-xs text-slate-400">Выберите активный отряд или сформируйте новый</p>
-            </div>
-          </div>
-          <button
-            onClick={logout}
-            className="flex items-center gap-1.5 bg-red-950/60 hover:bg-red-900 border border-bt-red/40 text-red-300 font-bold px-3 py-2 rounded text-xs transition-colors"
-          >
-            <LogOut className="w-4 h-4" /> Выход
-          </button>
-        </div>
-
-        {error && (
-          <div className="mb-6 p-4 bg-red-900/50 border border-bt-red rounded text-red-200 text-sm">
-            Не удалось загрузить список отрядов. Проверьте соединение с сервером.
-          </div>
-        )}
-
-        {/* Сетка отрядов */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {/* Карточка создания нового отряда */}
-          <Link
-            to="/forces/create"
-            className="bg-bt-card/50 hover:bg-bt-card border-2 border-dashed border-bt-border hover:border-bt-amber rounded-xl p-6 shadow-lg transition-all flex flex-col items-center justify-center text-center gap-3 min-h-[220px] group"
-          >
-            <div className="w-12 h-12 rounded-full bg-slate-900 border border-bt-border flex items-center justify-center group-hover:border-bt-amber group-hover:text-bt-amber transition-colors">
-              <PlusCircle className="w-6 h-6 text-slate-400 group-hover:text-bt-amber" />
-            </div>
-            <div>
-              <div className="font-bold text-white text-base group-hover:text-bt-amber transition-colors">
-                Сформировать новый отряд
-              </div>
-              <p className="text-xs text-slate-400 mt-1">
-                Стартовый баланс: 3000 SP, 2 пилота, техника из RAT
-              </p>
-            </div>
-          </Link>
-
-          {/* Превью существующих отрядов */}
-          {forces &&
-            forces.map((force) => (
-              <div
-                key={force.id}
-                onClick={() => navigate(`/forces/${force.id}`)}
-                className={`bg-bt-card border border-bt-border hover:border-bt-amber/60 rounded-xl p-6 shadow-xl transition-all cursor-pointer flex flex-col justify-between hover:translate-y-[-2px] group relative ${
-                  deletingId === force.id ? 'opacity-40 pointer-events-none' : ''
-                }`}
-              >
-                <div>
-                  <div className="flex justify-between items-start mb-2 gap-2">
-                    <h2 className="font-bold text-lg text-white group-hover:text-bt-amber transition-colors truncate">
-                      {force.name}
-                    </h2>
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      <span className="text-[10px] uppercase font-mono bg-bt-amber/10 border border-bt-amber/30 text-bt-amber px-2 py-0.5 rounded">
-                        {force.sponsoring_faction}
-                      </span>
-                      <button
-                        onClick={(e) => handleDelete(e, force.id, force.name)}
-                        className="p-1.5 bg-slate-900 hover:bg-red-950 border border-bt-border hover:border-red-500/50 rounded text-slate-400 hover:text-red-400 transition-colors"
-                        title="Удалить отряд"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
-                    </div>
-                  </div>
-
-                  {/* Статистика */}
-                  <div className="grid grid-cols-2 gap-2 bg-slate-900/80 p-3 rounded-lg border border-bt-border/50 my-4 text-xs">
-                    <div className="flex items-center gap-2">
-                      <Coins className="w-4 h-4 text-bt-amber" />
-                      <div>
-                        <span className="text-slate-500 block text-[9px] uppercase font-bold">Warchest (SP)</span>
-                        <span className="font-mono font-bold text-bt-amber">{force.support_points} SP</span>
-                      </div>
-                    </div>
-
-                    <div className="flex items-center gap-2">
-                      <Award className="w-4 h-4 text-bt-green" />
-                      <div>
-                        <span className="text-slate-500 block text-[9px] uppercase font-bold">Репутация</span>
-                        <span className="font-mono font-bold text-white">{force.reputation_score}</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="flex justify-between text-xs text-slate-400 border-t border-bt-border/40 pt-3">
-                    <span className="flex items-center gap-1">
-                      <Crosshair className="w-3.5 h-3.5 text-slate-500" /> Техники: <strong className="text-slate-200">{force.units?.length || 0}</strong>
-                    </span>
-                    <span className="flex items-center gap-1">
-                      <Users className="w-3.5 h-3.5 text-slate-500" /> Пилотов: <strong className="text-slate-200">{force.pilots?.length || 0}</strong>
-                    </span>
-                  </div>
-                </div>
-
-                <div className="mt-5 flex items-center justify-end text-xs font-bold text-bt-amber group-hover:underline gap-1">
-                  Открыть терминал <ArrowRight className="w-4 h-4" />
-                </div>
-              </div>
-            ))}
-        </div>
-      </div>
-    </div>
-  );
-};
-````
-
-## File: frontend/src/pages/ForceWizard/ForceCreationPage.tsx
-````typescript
-import React, { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { forcesApi } from '../../api/services';
-import type { StartingFactionOption, StartingMechSelection } from '../../types';
-import { Faction } from '../../types';
-import { Shield, Users, Crosshair, AlertTriangle, CheckCircle, ChevronRight, ChevronLeft } from 'lucide-react';
-
-export const ForceCreationPage: React.FC = () => {
-  const navigate = useNavigate();
-  const [step, setStep] = useState(1);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  // Опции с сервера
-  const [factionOptions, setFactionOptions] = useState<StartingFactionOption[]>([]);
-  const [maxBV2, setMaxBV2] = useState(3000);
-
-  // Форма отряда
-  const [forceName, setForceName] = useState('');
-  const [selectedFaction, setSelectedFaction] = useState<Faction>(Faction.MERCENARY);
-  const [pilot1, setPilot1] = useState('Pilot Alpha');
-  const [pilot2, setPilot2] = useState('Pilot Bravo');
-  const [selectedMechs, setSelectedMechs] = useState<StartingMechSelection[]>([]);
-
-  useEffect(() => {
-    const fetchOptions = async () => {
-      try {
-        const data = await forcesApi.getStartingOptions();
-        if (data.available_factions && data.available_factions.length > 0) {
-          setFactionOptions(data.available_factions);
-          setSelectedFaction(data.available_factions[0].faction);
-        }
-        if (data.max_starting_bv2) setMaxBV2(data.max_starting_bv2);
-      } catch (err: any) {
-        // Фоллбек-данные для разработки
-        setFactionOptions([
-          {
-            faction: Faction.MERCENARY,
-            display_name: 'Mercenary',
-            description: 'Наемные подразделения',
-            available_rat_mechs: [
-              { chassis: 'Locust', model: 'LCT-1V', tonnage: 20, weight_class: 'Light' as any, bv2: 532 },
-              { chassis: 'Commando', model: 'COM-2D', tonnage: 25, weight_class: 'Light' as any, bv2: 541 },
-              { chassis: 'Centurion', model: 'CN9-A', tonnage: 50, weight_class: 'Medium' as any, bv2: 945 },
-              { chassis: 'Shadow Hawk', model: 'SHD-2H', tonnage: 55, weight_class: 'Medium' as any, bv2: 1064 },
-              { chassis: 'Warhammer', model: 'WHM-6R', tonnage: 70, weight_class: 'Heavy' as any, bv2: 1299 }
-            ]
-          }
-        ]);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-    fetchOptions();
-  }, []);
-
-  const activeFactionObj = factionOptions.find((f) => f.faction === selectedFaction) || factionOptions[0];
-  const availableRatMechs = activeFactionObj?.available_rat_mechs || [];
-
-  const totalBV2 = selectedMechs.reduce((sum, mech) => sum + mech.bv2, 0);
-  const isBV2Exceeded = totalBV2 > maxBV2;
-  const isMechCountExceeded = selectedMechs.length > 2;
-
-  const toggleMechSelection = (mech: StartingMechSelection) => {
-    const exists = selectedMechs.some((m) => m.model === mech.model && m.chassis === mech.chassis);
-    if (exists) {
-      setSelectedMechs(selectedMechs.filter((m) => !(m.model === mech.model && m.chassis === mech.chassis)));
-    } else {
-      if (selectedMechs.length >= 2) return;
-      setSelectedMechs([...selectedMechs, mech]);
-    }
-  };
-
-  const handleSubmit = async () => {
-    if (isBV2Exceeded || isMechCountExceeded || selectedMechs.length === 0) return;
-    setError(null);
-    setIsSubmitting(true);
-
-    try {
-      const newForce = await forcesApi.createForce({
-        name: forceName,
-        sponsoring_faction: selectedFaction,
-        starting_pilot_names: [pilot1, pilot2],
-        selected_mechs: selectedMechs,
-      });
-      navigate(`/forces/${newForce.id}`);
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Не удалось сформировать отряд');
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  if (isLoading) {
-    return (
-      <div className="min-h-screen bg-bt-bg text-white flex items-center justify-center">
-        <p className="text-bt-amber animate-pulse font-mono">Загрузка стартовых параметров v0.2...</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-h-screen bg-bt-bg text-white p-6 flex flex-col items-center">
-      <div className="w-full max-w-4xl">
-        <div className="mb-8 text-center">
-          <h1 className="text-2xl font-bold text-bt-amber tracking-wider uppercase mb-2">
-            Мастер формирования наемного отряда
-          </h1>
-          <p className="text-slate-400 text-sm">Шаг {step} из 4</p>
-        </div>
-
-        {error && (
-          <div className="mb-6 p-4 bg-red-900/50 border border-bt-red rounded text-red-200 text-sm flex items-center gap-2">
-            <AlertTriangle className="w-5 h-5 flex-shrink-0" />
-            <span>{error}</span>
-          </div>
-        )}
-
-        <div className="bg-bt-card border border-bt-border rounded-lg p-6 shadow-2xl">
-          {/* Шаг 1: Название и Фракция */}
-          {step === 1 && (
-            <div className="space-y-6">
-              <h2 className="text-lg font-semibold text-white flex items-center gap-2 border-b border-bt-border pb-2">
-                <Shield className="text-bt-amber" /> Шаг 1: Название отряда и Фракция
-              </h2>
-              <div>
-                <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
-                  Название подразделения (3-50 символов)
-                </label>
-                <input
-                  type="text"
-                  value={forceName}
-                  onChange={(e) => setForceName(e.target.value)}
-                  placeholder="например: 2nd Iron Hounds"
-                  className="w-full bg-slate-900 border border-bt-border rounded p-3 text-white focus:outline-none focus:border-bt-amber"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
-                  Фракция происхождения
-                </label>
-                <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-                  {factionOptions.map((opt) => (
-                    <button
-                      key={opt.faction}
-                      type="button"
-                      onClick={() => {
-                        setSelectedFaction(opt.faction);
-                        setSelectedMechs([]);
-                      }}
-                      className={`p-3 rounded border text-left font-medium transition-colors ${
-                        selectedFaction === opt.faction
-                          ? 'bg-bt-amber/20 border-bt-amber text-bt-amber'
-                          : 'bg-slate-900 border-bt-border text-slate-300 hover:border-slate-500'
-                      }`}
-                    >
-                      <div className="font-bold">{opt.display_name || opt.faction}</div>
-                      {opt.description && <div className="text-xs text-slate-400 mt-1">{opt.description}</div>}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Шаг 2: Имена пилотов */}
-          {step === 2 && (
-            <div className="space-y-6">
-              <h2 className="text-lg font-semibold text-white flex items-center gap-2 border-b border-bt-border pb-2">
-                <Users className="text-bt-amber" /> Шаг 2: Стартовые мехварриоры
-              </h2>
-              <p className="text-xs text-bt-amber bg-bt-amber/10 p-3 rounded border border-bt-amber/30">
-                Каждый пилот получает 150 XP на старте для последующего развития навыков.
-              </p>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
-                    Позывной пилота 1
-                  </label>
-                  <input
-                    type="text"
-                    value={pilot1}
-                    onChange={(e) => setPilot1(e.target.value)}
-                    className="w-full bg-slate-900 border border-bt-border rounded p-3 text-white focus:outline-none focus:border-bt-amber"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs uppercase font-bold text-slate-400 mb-2">
-                    Позывной пилота 2
-                  </label>
-                  <input
-                    type="text"
-                    value={pilot2}
-                    onChange={(e) => setPilot2(e.target.value)}
-                    className="w-full bg-slate-900 border border-bt-border rounded p-3 text-white focus:outline-none focus:border-bt-amber"
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Шаг 3: Техника из RAT */}
-          {step === 3 && (
-            <div className="space-y-6">
-              <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-b border-bt-border pb-2 gap-2">
-                <h2 className="text-lg font-semibold text-white flex items-center gap-2">
-                  <Crosshair className="text-bt-amber" /> Шаг 3: Выбор техники из RAT (до 2 мехов)
-                </h2>
-                <div className="flex gap-4 font-mono text-sm">
-                  <span className={selectedMechs.length > 2 ? 'text-bt-red font-bold' : 'text-slate-300'}>
-                    Выбрано: {selectedMechs.length} / 2
-                  </span>
-                  <span className={isBV2Exceeded ? 'text-bt-red font-bold' : 'text-bt-green'}>
-                    Суммарный BV2: {totalBV2} / {maxBV2}
-                  </span>
-                </div>
-              </div>
-
-              {isBV2Exceeded && (
-                <div className="p-3 bg-red-900/40 border border-bt-red text-red-200 text-xs rounded">
-                  Превышен лимит BV2! Сумма не должна превышать {maxBV2} BV2.
-                </div>
-              )}
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 max-h-96 overflow-y-auto pr-2">
-                {availableRatMechs.map((mech) => {
-                  const isSelected = selectedMechs.some((m) => m.model === mech.model && m.chassis === mech.chassis);
-                  return (
-                    <div
-                      key={`${mech.chassis}-${mech.model}`}
-                      onClick={() => toggleMechSelection(mech)}
-                      className={`p-4 rounded border cursor-pointer transition-all ${
-                        isSelected
-                          ? 'bg-bt-amber/20 border-bt-amber'
-                          : 'bg-slate-900 border-bt-border hover:border-slate-500'
-                      }`}
-                    >
-                      <div className="flex justify-between items-start mb-2">
-                        <span className="font-bold text-white">{mech.chassis} {mech.model}</span>
-                        <span className="text-xs bg-slate-800 text-bt-amber px-2 py-1 rounded font-mono">
-                          {mech.bv2} BV2
-                        </span>
-                      </div>
-                      <div className="text-xs text-slate-400 flex justify-between">
-                        <span>Класс: {mech.weight_class}</span>
-                        <span>Тоннаж: {mech.tonnage} т</span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Шаг 4: Сводка */}
-          {step === 4 && (
-            <div className="space-y-6">
-              <h2 className="text-lg font-semibold text-white flex items-center gap-2 border-b border-bt-border pb-2">
-                <CheckCircle className="text-bt-green" /> Шаг 4: Итоговая сводка
-              </h2>
-
-              <div className="grid grid-cols-2 gap-4 bg-slate-900 p-4 rounded border border-bt-border text-sm">
-                <div>
-                  <span className="text-slate-400 block text-xs uppercase">Название:</span>
-                  <span className="font-bold text-white">{forceName}</span>
-                </div>
-                <div>
-                  <span className="text-slate-400 block text-xs uppercase">Фракция:</span>
-                  <span className="font-bold text-bt-amber">{selectedFaction}</span>
-                </div>
-                <div>
-                  <span className="text-slate-400 block text-xs uppercase">Стартовый баланс:</span>
-                  <span className="font-bold text-bt-green">3000 SP</span>
-                </div>
-                <div>
-                  <span className="text-slate-400 block text-xs uppercase">Репутация:</span>
-                  <span className="font-bold text-white">1</span>
-                </div>
-              </div>
-
-              <div>
-                <h3 className="text-xs uppercase font-bold text-slate-400 mb-2">Пилоты:</h3>
-                <div className="flex gap-4">
-                  <span className="bg-slate-900 border border-bt-border px-3 py-1 rounded text-sm text-slate-200">
-                    {pilot1} (150 XP)
-                  </span>
-                  <span className="bg-slate-900 border border-bt-border px-3 py-1 rounded text-sm text-slate-200">
-                    {pilot2} (150 XP)
-                  </span>
-                </div>
-              </div>
-
-              <div>
-                <h3 className="text-xs uppercase font-bold text-slate-400 mb-2">Выбранная техника:</h3>
-                <div className="grid grid-cols-2 gap-3">
-                  {selectedMechs.map((m) => (
-                    <div key={`${m.chassis}-${m.model}`} className="bg-slate-900 p-3 rounded border border-bt-border text-xs">
-                      <div className="font-bold text-white">{m.chassis} {m.model}</div>
-                      <div className="text-slate-400">{m.bv2} BV2 | {m.tonnage} т</div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          )}
-
-          {/* Панель навигации */}
-          <div className="mt-8 flex justify-between items-center pt-4 border-t border-bt-border">
-            {step > 1 ? (
-              <button
-                type="button"
-                onClick={() => setStep(step - 1)}
-                className="flex items-center gap-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold px-4 py-2 rounded transition-colors text-sm"
-              >
-                <ChevronLeft className="w-4 h-4" /> Назад
-              </button>
-            ) : (
-              <div />
-            )}
-
-            {step < 4 ? (
-              <button
-                type="button"
-                disabled={
-                  (step === 1 && forceName.trim().length < 3) ||
-                  (step === 2 && (!pilot1.trim() || !pilot2.trim())) ||
-                  (step === 3 && (selectedMechs.length === 0 || isBV2Exceeded))
-                }
-                onClick={() => setStep(step + 1)}
-                className="flex items-center gap-1 bg-bt-amber hover:bg-amber-600 text-slate-950 font-bold px-4 py-2 rounded transition-colors text-sm disabled:opacity-50"
-              >
-                Далее <ChevronRight className="w-4 h-4" />
-              </button>
-            ) : (
-              <button
-                type="button"
-                disabled={isSubmitting}
-                onClick={handleSubmit}
-                className="bg-bt-green hover:bg-emerald-600 text-slate-950 font-bold px-6 py-2 rounded transition-colors text-sm disabled:opacity-50"
-              >
-                {isSubmitting ? 'Формирование...' : 'Сформировать отряд'}
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-};
-````
-
-## File: frontend/src/store/authStore.ts
-````typescript
-import { create } from 'zustand';
-
-interface AuthState {
-  token: string | null;
-  isAuthenticated: boolean;
-  setToken: (token: string | null) => void;
-  logout: () => void;
-}
-
-export const useAuthStore = create<AuthState>((set) => ({
-  token: localStorage.getItem('token'),
-  isAuthenticated: !!localStorage.getItem('token'),
-  setToken: (token) => {
-    if (token) {
-      localStorage.setItem('token', token);
-      set({ token, isAuthenticated: true });
-    } else {
-      localStorage.removeItem('token');
-      set({ token: null, isAuthenticated: false });
-    }
-  },
-  logout: () => {
-    localStorage.removeItem('token');
-    set({ token: null, isAuthenticated: false });
-  },
-}));
-````
-
-## File: frontend/src/types/auth.ts
-````typescript
-export interface User {
-  id: string;
-  username: string;
-  is_active: boolean;
-}
-
-export interface Token {
-  access_token: string;
-  token_type: string;
-}
-
-export interface LoginPayload {
-  username: string;
-  password: string;
-}
-````
-
-## File: frontend/src/types/index.ts
-````typescript
-export const Faction = {
-  DRACONIS_COMBINE: "Draconis Combine",
-  FEDERATED_SUNS: "Federated Suns",
-  RAVEN_ALLIANCE: "Raven Alliance",
-  CLAN_SEA_FOX: "Clan Sea Fox",
-  REPUBLIC_OF_THE_SPHERE: "Republic of the Sphere",
-  MERCENARY: "Mercenary"
-} as const;
-
-export type Faction = (typeof Faction)[keyof typeof Faction];
-
-export const UnitStatus = {
-  OPERATIONAL: "Operational",
-  DAMAGED: "Damaged",
-  DESTROYED: "Destroyed",
-  TRULY_DESTROYED: "Truly Destroyed"
-} as const;
-export type UnitStatus = (typeof UnitStatus)[keyof typeof UnitStatus];
-
-export const WeightClass = {
-  LIGHT: "Light",
-  MEDIUM: "Medium",
-  HEAVY: "Heavy",
-  ASSAULT: "Assault"
-} as const;
-export type WeightClass = (typeof WeightClass)[keyof typeof WeightClass];
-
-export interface NamedPilot {
-  id: string;
-  force_id?: string | null;
-  name: string;
-  gunnery: number;
-  piloting: number;
-  experience_points: number;
-  total_xp_earned: number;
-  edge_points: number;
-  special_abilities: string[];
-  is_temporary_hire: boolean;
-}
-
-export interface MechUnit {
-  id: string;
-  force_id?: string | null;
-  chassis: string;
-  model: string;
-  tonnage: number;
-  weight_class: WeightClass;
-  bv2: number;
-  status: UnitStatus;
-  assigned_pilot_id?: string | null;
-}
-
-export interface StartingMechSelection {
-  chassis: string;
-  model: string;
-  tonnage: number;
-  weight_class: WeightClass;
-  bv2: number;
-}
-
-export interface ForceCreate {
-  name: string;
-  sponsoring_faction: Faction;
-  starting_pilot_names: [string, string];
-  selected_mechs: StartingMechSelection[];
-}
-
-export interface ForceResponse {
-  id: string;
-  owner_id: string;
-  name: string;
-  sponsoring_faction: Faction;
-  support_points: number;
-  reputation_score: number;
-  units: MechUnit[];
-  pilots: NamedPilot[];
-}
-
-export interface AssignPilotRequest {
-  unit_id: string;
-  pilot_id?: string | null;
-}
-
-export interface StartingFactionOption {
-  faction: Faction;
-  display_name: string;
-  description: string;
-  available_rat_mechs: StartingMechSelection[];
-}
-
-export interface StartingOptionsResponse {
-  available_factions: StartingFactionOption[];
-  max_starting_mechs: number;
-  max_starting_bv2: number;
-  starting_sp: number;
-  starting_reputation: number;
-  starting_pilots_count: number;
-  starting_xp_per_pilot: number;
-}
-
-export interface NamedPilot {
-  id: string;
-  force_id?: string | null;
-  name: string;
-  gunnery: number; 
-  piloting: number; 
-  experience_points: number;
-  total_xp_earned: number;
-  edge_points: number;
-  special_abilities: string[];
-  is_temporary_hire: boolean;
-}
-
-export type SkillUpgrade = {
-  upgrade_type: "gunnery" | "piloting";
-};
-
-export type EdgeUpgrade = {
-  upgrade_type: "edge";
-};
-
-export type AbilityUpgrade = {
-  upgrade_type: "ability";
-  ability_name: string;
-};
-
-export type PilotUpgradeRequest = SkillUpgrade | EdgeUpgrade | AbilityUpgrade;
-````
-
-## File: frontend/src/App.css
-````css
-.counter {
-  font-size: 16px;
-  padding: 5px 10px;
-  border-radius: 5px;
-  color: var(--accent);
-  background: var(--accent-bg);
-  border: 2px solid transparent;
-  transition: border-color 0.3s;
-  margin-bottom: 24px;
-
-  &:hover {
-    border-color: var(--accent-border);
-  }
-  &:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-  }
-}
-
-.hero {
-  position: relative;
-
-  .base,
-  .framework,
-  .vite {
-    inset-inline: 0;
-    margin: 0 auto;
-  }
-
-  .base {
-    width: 170px;
-    position: relative;
-    z-index: 0;
-  }
-
-  .framework,
-  .vite {
-    position: absolute;
-  }
-
-  .framework {
-    z-index: 1;
-    top: 34px;
-    height: 28px;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(44deg) rotateY(39deg)
-      scale(1.4);
-  }
-
-  .vite {
-    z-index: 0;
-    top: 107px;
-    height: 26px;
-    width: auto;
-    transform: perspective(2000px) rotateZ(300deg) rotateX(40deg) rotateY(39deg)
-      scale(0.8);
-  }
-}
-
-#center {
-  display: flex;
-  flex-direction: column;
-  gap: 25px;
-  place-content: center;
-  place-items: center;
-  flex-grow: 1;
-
-  @media (max-width: 1024px) {
-    padding: 32px 20px 24px;
-    gap: 18px;
-  }
-}
-
-#next-steps {
-  display: flex;
-  border-top: 1px solid var(--border);
-  text-align: left;
-
-  & > div {
-    flex: 1 1 0;
-    padding: 32px;
-    @media (max-width: 1024px) {
-      padding: 24px 20px;
-    }
-  }
-
-  .icon {
-    margin-bottom: 16px;
-    width: 22px;
-    height: 22px;
-  }
-
-  @media (max-width: 1024px) {
-    flex-direction: column;
-    text-align: center;
-  }
-}
-
-#docs {
-  border-right: 1px solid var(--border);
-
-  @media (max-width: 1024px) {
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-}
-
-#next-steps ul {
-  list-style: none;
-  padding: 0;
-  display: flex;
-  gap: 8px;
-  margin: 32px 0 0;
-
-  .logo {
-    height: 18px;
-  }
-
-  a {
-    color: var(--text-h);
-    font-size: 16px;
-    border-radius: 6px;
-    background: var(--social-bg);
-    display: flex;
-    padding: 6px 12px;
-    align-items: center;
-    gap: 8px;
-    text-decoration: none;
-    transition: box-shadow 0.3s;
-
-    &:hover {
-      box-shadow: var(--shadow);
-    }
-    .button-icon {
-      height: 18px;
-      width: 18px;
-    }
-  }
-
-  @media (max-width: 1024px) {
-    margin-top: 20px;
-    flex-wrap: wrap;
-    justify-content: center;
-
-    li {
-      flex: 1 1 calc(50% - 8px);
-    }
-
-    a {
-      width: 100%;
-      justify-content: center;
-      box-sizing: border-box;
-    }
-  }
-}
-
-#spacer {
-  height: 88px;
-  border-top: 1px solid var(--border);
-  @media (max-width: 1024px) {
-    height: 48px;
-  }
-}
-
-.ticks {
-  position: relative;
-  width: 100%;
-
-  &::before,
-  &::after {
-    content: '';
-    position: absolute;
-    top: -4.5px;
-    border: 5px solid transparent;
-  }
-
-  &::before {
-    left: 0;
-    border-left-color: var(--border);
-  }
-  &::after {
-    right: 0;
-    border-right-color: var(--border);
-  }
-}
-````
-
-## File: frontend/src/App.tsx
-````typescript
-import React from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { ProtectedRoute } from './components/common/ProtectedRoute';
-import { LoginPage } from './pages/Auth/LoginPage';
-import { RegisterPage } from './pages/Auth/RegisterPage';
-import { ForceCreationPage } from './pages/ForceWizard/ForceCreationPage';
-import { DashboardPage } from './pages/Dashboard/DashboardPage';
-import { ForceSelectionPage } from './pages/ForceSelection/ForceSelectionPage';
-import { PilotProgressionPage } from './pages/Pilot/PilotProgressionPage';
-
-const queryClient = new QueryClient();
-
-export const App: React.FC = () => {
-  return (
-    <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<LoginPage />} />
-          <Route path="/register" element={<RegisterPage />} />
-
-          {/* Защищенные маршруты */}
-          <Route element={<ProtectedRoute />}>
-            <Route path="/" element={<ForceSelectionPage />} />
-            <Route path="/forces/create" element={<ForceCreationPage />} />
-            <Route path="/forces/:id" element={<DashboardPage />} />
-            <Route path="/pilots/:id" element={<PilotProgressionPage />} />
-          </Route>
-
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </BrowserRouter>
-    </QueryClientProvider>
-  );
-};
-
-export default App;
-````
-
-## File: frontend/src/index.css
-````css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-
-:root {
-  --text: #6b6375;
-  --text-h: #08060d;
-  --bg: #fff;
-  --border: #e5e4e7;
-  --code-bg: #f4f3ec;
-  --accent: #aa3bff;
-  --accent-bg: rgba(170, 59, 255, 0.1);
-  --accent-border: rgba(170, 59, 255, 0.5);
-  --social-bg: rgba(244, 243, 236, 0.5);
-  --shadow:
-    rgba(0, 0, 0, 0.1) 0 10px 15px -3px, rgba(0, 0, 0, 0.05) 0 4px 6px -2px;
-
-  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
-  --mono: ui-monospace, Consolas, monospace;
-
-  font: 18px/145% var(--sans);
-  letter-spacing: 0.18px;
-  color-scheme: light dark;
-  color: var(--text);
-  background: var(--bg);
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 16px;
-  }
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --text: #9ca3af;
-    --text-h: #f3f4f6;
-    --bg: #16171d;
-    --border: #2e303a;
-    --code-bg: #1f2028;
-    --accent: #c084fc;
-    --accent-bg: rgba(192, 132, 252, 0.15);
-    --accent-border: rgba(192, 132, 252, 0.5);
-    --social-bg: rgba(47, 48, 58, 0.5);
-    --shadow:
-      rgba(0, 0, 0, 0.4) 0 10px 15px -3px, rgba(0, 0, 0, 0.25) 0 4px 6px -2px;
-  }
-
-  #social .button-icon {
-    filter: invert(1) brightness(2);
-  }
-}
-
-#root {
-  width: 1126px;
-  max-width: 100%;
-  margin: 0 auto;
-  text-align: center;
-  border-inline: 1px solid var(--border);
-  min-height: 100svh;
-  display: flex;
-  flex-direction: column;
-  box-sizing: border-box;
-}
-
-body {
-  margin: 0;
-}
-
-h1,
-h2 {
-  font-family: var(--heading);
-  font-weight: 500;
-  color: var(--text-h);
-}
-
-h1 {
-  font-size: 56px;
-  letter-spacing: -1.68px;
-  margin: 32px 0;
-  @media (max-width: 1024px) {
-    font-size: 36px;
-    margin: 20px 0;
-  }
-}
-h2 {
-  font-size: 24px;
-  line-height: 118%;
-  letter-spacing: -0.24px;
-  margin: 0 0 8px;
-  @media (max-width: 1024px) {
-    font-size: 20px;
-  }
-}
-p {
-  margin: 0;
-}
-
-code,
-.counter {
-  font-family: var(--mono);
-  display: inline-flex;
-  border-radius: 4px;
-  color: var(--text-h);
-}
-
-code {
-  font-size: 15px;
-  line-height: 135%;
-  padding: 4px 8px;
-  background: var(--code-bg);
-}
-````
-
-## File: frontend/src/main.tsx
-````typescript
-import { StrictMode } from 'react'
-import { createRoot } from 'react-dom/client'
-import './index.css'
-import App from './App.tsx'
-
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-  </StrictMode>,
-)
-````
-
-## File: frontend/.oxlintrc.json
-````json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
-````
-
-## File: frontend/index.html
-````html
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>frontend</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
-</html>
-````
-
-## File: frontend/package.json
-````json
-{
-  "name": "frontend",
-  "private": true,
-  "version": "0.0.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "lint": "oxlint",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "@tanstack/react-query": "^5.104.4",
-    "axios": "^1.20.0",
-    "lucide-react": "^1.59.0",
-    "react": "^19.3.1",
-    "react-dom": "^19.3.1",
-    "react-router-dom": "^7.18.4",
-    "zustand": "^5.0.15"
-  },
-  "devDependencies": {
-    "@types/node": "^24.19.2",
-    "@types/react": "^19.3.0",
-    "@types/react-dom": "^19.3.0",
-    "@vitejs/plugin-react": "^6.1.2",
-    "autoprefixer": "^10.6.1",
-    "oxlint": "^1.88.0",
-    "postcss": "^8.5.31",
-    "tailwindcss": "^3.4.19",
-    "typescript": "~7.0.2",
-    "vite": "^8.3.4"
-  }
-}
-````
-
-## File: frontend/postcss.config.js
-````javascript
-export default {
-  plugins: {
-    tailwindcss: {},
-    autoprefixer: {},
-  },
-}
-````
-
-## File: frontend/tailwind.config.js
-````javascript
-/** @type {import('tailwindcss').Config} */
-export default {
-  content: [
-    "./index.html",
-    "./src/**/*.{js,ts,jsx,tsx}",
-  ],
-  theme: {
-    extend: {
-      colors: {
-        bt: {
-          bg: '#0F172A',         // Slate 900
-          card: '#1E293B',       // Slate 800
-          border: '#334155',     // Slate 700
-          amber: '#F59E0B',      // Акцент Warchest / SP
-          green: '#10B981',      // Акцент успеха / Операбелен
-          red: '#EF4444',        // Критические повреждения / Уничтожен
-          blue: '#3B82F6',       // Опыт XP / Пилоты
-        }
-      }
-    },
-  },
-  plugins: [],
-}
-````
-
-## File: frontend/tsconfig.app.json
-````json
-{
-  "compilerOptions": {
-    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
-    "target": "es2023",
-    "lib": ["ES2023", "DOM"],
-    "module": "esnext",
-    "types": ["vite/client"],
-    "allowArbitraryExtensions": true,
-    "skipLibCheck": true,
-
-    /* Bundler mode */
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "verbatimModuleSyntax": true,
-    "moduleDetection": "force",
-    "noEmit": true,
-    "jsx": "react-jsx",
-
-    /* Linting */
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "erasableSyntaxOnly": false,
-    "noFallthroughCasesInSwitch": true
-  },
-  "include": ["src"]
-}
-````
-
-## File: frontend/tsconfig.json
-````json
-{
-  "files": [],
-  "references": [
-    { "path": "./tsconfig.app.json" },
-    { "path": "./tsconfig.node.json" }
-  ]
-}
-````
-
-## File: frontend/tsconfig.node.json
-````json
-{
-  "compilerOptions": {
-    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
-    "target": "es2023",
-    "lib": ["ES2023"],
-    "types": ["node"],
-    "skipLibCheck": true,
-
-    /* Bundler mode */
-    "module": "nodenext",
-    "allowImportingTsExtensions": true,
-    "verbatimModuleSyntax": true,
-    "moduleDetection": "force",
-    "noEmit": true,
-
-    /* Linting */
-    "noUnusedLocals": true,
-    "noUnusedParameters": true,
-    "erasableSyntaxOnly": true,
-    "noFallthroughCasesInSwitch": true
-  },
-  "include": ["vite.config.ts"]
-}
-````
-
-## File: frontend/vite.config.ts
-````typescript
-import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
-
-// https://vite.dev/config/
-export default defineConfig({
-  plugins: [react()],
-})
-````
-
-## File: src/chaos_campaign_api/__init__.py
-````python
-def main() -> None:
-    print("Hello from chaos-campaign-api!")
-````
-
-## File: .python-version
-````
-3.15
-````
-
-## File: pytest.ini
-````ini
-[pytest]
-asyncio_mode = auto
-testpaths = app/tests
-python_files = test_*.py
-pythonpath = .
 ````
 
 ## File: app/api/v1/endpoints/tracks.py
@@ -9246,36 +8812,6 @@ async def chaos_campaign_exception_handler(request: Request, exc: ChaosCampaignE
             "path": request.url.path
         }
     )
-````
-
-## File: app/db/models/pilot.py
-````python
-import uuid
-from typing import List, Optional
-from sqlalchemy import String, Integer, Boolean, ForeignKey, JSON
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.db.database import Base
-
-
-class PilotModel(Base):
-    __tablename__ = "pilots"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    force_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("forces.id", ondelete="CASCADE"), nullable=True)
-    name: Mapped[str] = mapped_column(String(100), nullable=False)
-    gunnery: Mapped[int] = mapped_column(Integer, default=4)
-    piloting: Mapped[int] = mapped_column(Integer, default=5)
-    
-    # Стартовый запас опыта у пилотов — 150 XP
-    experience_points: Mapped[int] = mapped_column(Integer, default=150)
-    total_xp_earned: Mapped[int] = mapped_column(Integer, default=150)
-    
-    edge_points: Mapped[int] = mapped_column(Integer, default=1)
-    special_abilities: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
-
-    is_temporary_hire: Mapped[bool] = mapped_column(Boolean, default=False)
-
-    force: Mapped[Optional["ForceModel"]] = relationship("ForceModel", back_populates="pilots")
 ````
 
 ## File: app/db/models/user.py
@@ -9570,6 +9106,100 @@ class NegotiationEngine:
                 current=force.reputation_score
             )
         return True
+````
+
+## File: app/services/pilot_service.py
+````python
+from typing import List
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
+from app.core.exceptions import InsufficientXPError
+from app.db.models.pilot import PilotModel
+from app.schemas.pilot import (
+    AbilityUpgrade,
+    EdgeUpgrade,
+    PilotUpgradeRequest,
+    SkillUpgrade,
+)
+
+# Нелинейные таблицы стоимости прокачки пилотов (в XP) согласно спецификации v3.0
+GUNNERY_UPGRADE_COSTS = {4: 300, 3: 700, 2: 1200, 1: 2200}
+PILOTING_UPGRADE_COSTS = {5: 100, 4: 200, 3: 700, 2: 1200}
+EDGE_UPGRADE_COSTS = {
+    1: 60, 2: 120, 3: 200, 4: 300, 5: 420,
+    6: 560, 7: 720, 8: 900, 9: 1100
+}
+SPA_COST_TABLE = [60, 180, 360, 600, 900]
+
+
+class PilotService:
+    @staticmethod
+    async def upgrade_pilot(
+        db: AsyncSession, 
+        pilot: PilotModel, 
+        request: PilotUpgradeRequest
+    ) -> PilotModel:
+        """
+        Прокачивает характеристики пилота за XP в рамках асинхронной транзакции БД.
+        
+        :raises InsufficientXPError: Если у пилота недостаточно experience_points.
+        :raises ValueError: Если достигнут лимит развития параметра.
+        """
+        if isinstance(request, SkillUpgrade):
+            if request.upgrade_type == "gunnery":
+                cost = GUNNERY_UPGRADE_COSTS.get(pilot.gunnery)
+                if cost is None:
+                    raise ValueError("Достигнут максимальный навык Gunnery (0)")
+                if pilot.experience_points < cost:
+                    raise InsufficientXPError(required=cost, available=pilot.experience_points)
+                pilot.experience_points -= cost
+                pilot.gunnery -= 1
+
+            elif request.upgrade_type == "piloting":
+                cost = PILOTING_UPGRADE_COSTS.get(pilot.piloting)
+                if cost is None:
+                    raise ValueError("Достигнут максимальный навык Piloting (1)")
+                if pilot.experience_points < cost:
+                    raise InsufficientXPError(required=cost, available=pilot.experience_points)
+                pilot.experience_points -= cost
+                pilot.piloting -= 1
+
+        elif isinstance(request, EdgeUpgrade):
+            cost = EDGE_UPGRADE_COSTS.get(pilot.edge_points)
+            if cost is None:
+                raise ValueError("Достигнуто максимальное значение Edge (10)")
+            if pilot.experience_points < cost:
+                raise InsufficientXPError(required=cost, available=pilot.experience_points)
+            pilot.experience_points -= cost
+            pilot.edge_points += 1
+
+        elif isinstance(request, AbilityUpgrade):
+            ability_name = request.ability_name.strip()
+            if not ability_name:
+                raise ValueError("Название способности не может быть пустым")
+
+            current_abilities = list(getattr(pilot, "special_abilities", []) or [])
+            if len(current_abilities) >= 5:
+                raise ValueError("Достигнут лимит в 5 специальных способностей")
+
+            if ability_name in current_abilities:
+                raise ValueError("Эта способность уже изучена пилотом")
+
+            ability_index = min(len(current_abilities), len(SPA_COST_TABLE) - 1)
+            cost = SPA_COST_TABLE[ability_index]
+
+            if pilot.experience_points < cost:
+                raise InsufficientXPError(required=cost, available=pilot.experience_points)
+
+            pilot.experience_points -= cost
+            current_abilities.append(ability_name)
+            pilot.special_abilities = current_abilities
+            flag_modified(pilot, "special_abilities")
+
+        db.add(pilot)
+        await db.commit()
+        await db.refresh(pilot)
+        return pilot
 ````
 
 ## File: app/services/track_service.py
@@ -9935,6 +9565,720 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+````
+
+## File: frontend/src/api/client.ts
+````typescript
+import axios from 'axios';
+import { useAuthStore } from '../store/authStore';
+
+export const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_URL || '/api/v1',
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+apiClient.interceptors.request.use((config) => {
+  const token = useAuthStore.getState().token;
+  if (token && config.headers) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
+apiClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response?.status === 401) {
+      useAuthStore.getState().logout();
+    }
+    return Promise.reject(error);
+  }
+);
+````
+
+## File: frontend/src/pages/Auth/RegisterPage.tsx
+````typescript
+import React, { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import { authApi } from '../../api/services';
+import { Shield, Lock, User as UserIcon } from 'lucide-react';
+
+export const RegisterPage: React.FC = () => {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+
+  const navigate = useNavigate();
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setError(null);
+    setIsLoading(true);
+
+    try {
+      await authApi.register({ username, password });
+      navigate('/login');
+    } catch (err: any) {
+      const detail = err.response?.data?.detail;
+      if (typeof detail === 'string') {
+        setError(detail);
+      } else if (Array.isArray(detail)) {
+        setError(detail.map((item: any) => item.msg || JSON.stringify(item)).join(', '));
+      } else if (detail && typeof detail === 'object') {
+        setError(JSON.stringify(detail));
+      } else {
+        setError('Ошибка регистрации');
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-bt-bg flex items-center justify-center p-4">
+      <div className="w-full max-w-md bg-bt-card border border-bt-border rounded-lg p-6 shadow-xl">
+        <div className="flex items-center justify-center gap-3 mb-6">
+          <Shield className="w-8 h-8 text-bt-amber" />
+          <h1 className="text-xl font-bold text-white tracking-wide">
+            РЕГИСТРАЦИЯ КОМАНДИРА
+          </h1>
+        </div>
+
+        {error && (
+          <div className="mb-4 p-3 bg-red-900/50 border border-bt-red text-red-200 text-sm rounded">
+            {error}
+          </div>
+        )}
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          <div>
+            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
+              Имя пользователя / Позывной
+            </label>
+            <div className="relative">
+              <UserIcon className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
+              <input
+                type="text"
+                required
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
+                placeholder="Commander"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs uppercase font-bold text-slate-400 mb-1">
+              Пароль
+            </label>
+            <div className="relative">
+              <Lock className="w-5 h-5 absolute left-3 top-2.5 text-slate-500" />
+              <input
+                type="password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full bg-slate-900 border border-bt-border rounded pl-10 pr-3 py-2 text-white focus:outline-none focus:border-bt-amber"
+                placeholder="••••••••"
+              />
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={isLoading}
+            className="w-full bg-bt-amber hover:bg-amber-600 text-slate-950 font-bold py-2 px-4 rounded transition-colors disabled:opacity-50"
+          >
+            {isLoading ? 'Создание записи...' : 'Создать учетную запись'}
+          </button>
+        </form>
+
+        <p className="mt-4 text-center text-sm text-slate-400">
+          Уже зарегистрированы?{' '}
+          <Link to="/login" className="text-bt-amber hover:underline">
+            Войти
+          </Link>
+        </p>
+      </div>
+    </div>
+  );
+};
+````
+
+## File: frontend/src/types/index.ts
+````typescript
+export const Faction = {
+  DRACONIS_COMBINE: "Draconis Combine",
+  FEDERATED_SUNS: "Federated Suns",
+  RAVEN_ALLIANCE: "Raven Alliance",
+  CLAN_SEA_FOX: "Clan Sea Fox",
+  REPUBLIC_OF_THE_SPHERE: "Republic of the Sphere",
+  MERCENARY: "Mercenary"
+} as const;
+
+export type Faction = (typeof Faction)[keyof typeof Faction];
+
+export const UnitStatus = {
+  OPERATIONAL: "Operational",
+  DAMAGED: "Damaged",
+  DESTROYED: "Destroyed",
+  TRULY_DESTROYED: "Truly Destroyed"
+} as const;
+export type UnitStatus = (typeof UnitStatus)[keyof typeof UnitStatus];
+
+export const WeightClass = {
+  LIGHT: "Light",
+  MEDIUM: "Medium",
+  HEAVY: "Heavy",
+  ASSAULT: "Assault"
+} as const;
+export type WeightClass = (typeof WeightClass)[keyof typeof WeightClass];
+
+export interface NamedPilot {
+  id: string;
+  force_id?: string | null;
+  name: string;
+  gunnery: number;
+  piloting: number;
+  experience_points: number;
+  total_xp_earned: number;
+  edge_points: number;
+  special_abilities: string[];
+  is_temporary_hire: boolean;
+}
+
+export interface MechUnit {
+  id: string;
+  force_id?: string | null;
+  chassis: string;
+  model: string;
+  tonnage: number;
+  weight_class: WeightClass;
+  bv2: number;
+  status: UnitStatus;
+  assigned_pilot_id?: string | null;
+}
+
+export interface StartingMechSelection {
+  chassis: string;
+  model: string;
+  tonnage: number;
+  weight_class: WeightClass;
+  bv2: number;
+}
+
+export interface ForceCreate {
+  name: string;
+  sponsoring_faction: Faction;
+  starting_pilot_names: [string, string];
+  selected_mechs: StartingMechSelection[];
+}
+
+export interface ForceResponse {
+  id: string;
+  owner_id: string;
+  name: string;
+  sponsoring_faction: Faction;
+  support_points: number;
+  reputation_score: number;
+  units: MechUnit[];
+  pilots: NamedPilot[];
+}
+
+export interface AssignPilotRequest {
+  unit_id: string;
+  pilot_id?: string | null;
+}
+
+export interface StartingFactionOption {
+  faction: Faction;
+  display_name: string;
+  description: string;
+  available_rat_mechs: StartingMechSelection[];
+}
+
+export interface StartingOptionsResponse {
+  available_factions: StartingFactionOption[];
+  max_starting_mechs: number;
+  max_starting_bv2: number;
+  starting_sp: number;
+  starting_reputation: number;
+  starting_pilots_count: number;
+  starting_xp_per_pilot: number;
+}
+
+export interface NamedPilot {
+  id: string;
+  force_id?: string | null;
+  name: string;
+  gunnery: number; 
+  piloting: number; 
+  experience_points: number;
+  total_xp_earned: number;
+  edge_points: number;
+  special_abilities: string[];
+  is_temporary_hire: boolean;
+}
+
+export type SkillUpgrade = {
+  upgrade_type: "gunnery" | "piloting";
+};
+
+export type EdgeUpgrade = {
+  upgrade_type: "edge";
+};
+
+export type AbilityUpgrade = {
+  upgrade_type: "ability";
+  ability_name: string;
+};
+
+export type PilotUpgradeRequest = SkillUpgrade | EdgeUpgrade | AbilityUpgrade;
+````
+
+## File: frontend/src/App.tsx
+````typescript
+import React from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { ProtectedRoute } from './components/common/ProtectedRoute';
+import { LoginPage } from './pages/Auth/LoginPage';
+import { RegisterPage } from './pages/Auth/RegisterPage';
+import { ForceCreationPage } from './pages/ForceWizard/ForceCreationPage';
+import { DashboardPage } from './pages/Dashboard/DashboardPage';
+import { ForceSelectionPage } from './pages/ForceSelection/ForceSelectionPage';
+import { PilotProgressionPage } from './pages/Pilot/PilotProgressionPage';
+
+const queryClient = new QueryClient();
+
+export const App: React.FC = () => {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route path="/register" element={<RegisterPage />} />
+
+          {/* Защищенные маршруты */}
+          <Route element={<ProtectedRoute />}>
+            <Route path="/" element={<ForceSelectionPage />} />
+            <Route path="/forces/create" element={<ForceCreationPage />} />
+            <Route path="/forces/:id" element={<DashboardPage />} />
+            <Route path="/pilots/:id" element={<PilotProgressionPage />} />
+          </Route>
+
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>
+  );
+};
+
+export default App;
+````
+
+## File: frontend/tsconfig.app.json
+````json
+{
+  "compilerOptions": {
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM"],
+    "module": "esnext",
+    "types": ["vite/client"],
+    "allowArbitraryExtensions": true,
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "erasableSyntaxOnly": false,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["src"]
+}
+````
+
+## File: .gitignore
+````
+# Python files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.pyc
+.pytest_cache/
+*.db
+*.sqlite
+*.sqlite3
+
+# Virtual environments
+.venv
+.env
+.db
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+````
+
+## File: app/api/v1/endpoints/forces.py
+````python
+import json
+from typing import Any, Dict, List
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, UploadFile, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from app.db.database import get_db
+from app.db.models.force import ForceModel, MechUnitModel
+from app.db.models.pilot import PilotModel
+from app.db.models.user import UserModel
+from app.dependencies.auth import get_current_user
+from app.dependencies.campaign import verify_force_ownership
+from app.schemas.force import AssignPilotRequest, ForceCreate, ForceResponse
+from app.services.force_service import ForceService
+from fastapi.encoders import jsonable_encoder
+
+router = APIRouter()
+
+
+@router.get("/starting-options", response_model=Dict[str, Any], summary="Получение стартовых опций для создания отряда")
+async def get_starting_options():
+    """Возвращает список доступных фракций с их описанием и RAT-мехами."""
+    default_mechs = [
+        {"chassis": "Flea", "model": "FLE-17", "weight_class": "Light", "tonnage": 20, "bv2": 510},
+        {"chassis": "Flea", "model": "FLE-21", "weight_class": "Light", "tonnage": 20, "bv2": 826},
+        {"chassis": "Chameleon", "model": "CLN-7V", "weight_class": "Medium", "tonnage": 50, "bv2": 1042},
+        {"chassis": "Quickdraw", "model": "QKD-5M", "weight_class": "Heavy", "tonnage": 60, "bv2": 1237},
+        {"chassis": "Ostsol", "model": "OTL-5M", "weight_class": "Heavy", "tonnage": 60, "bv2": 1245},
+        {"chassis": "Chameleon", "model": "CLN-8V", "weight_class": "Medium", "tonnage": 50, "bv2": 1426},
+        {"chassis": "Starslayer", "model": "STY-3C", "weight_class": "Medium", "tonnage": 50, "bv2": 1508},
+        {"chassis": "Ostsol", "model": "OTL-8E", "weight_class": "Heavy", "tonnage": 60, "bv2": 1552},
+        {"chassis": "Caesar", "model": "CES-3R", "weight_class": "Heavy", "tonnage": 70, "bv2": 1578},
+        {"chassis": "Caesar", "model": "CES-5R", "weight_class": "Heavy", "tonnage": 70, "bv2": 2192},
+        {"chassis": "Starslayer", "model": "STY-4C", "weight_class": "Medium", "tonnage": 50, "bv2": 2218},
+        {"chassis": "Quickdraw", "model": "QKD-9G", "weight_class": "Heavy", "tonnage": 60, "bv2": 2224},
+        {"chassis": "Devastator", "model": "DVS-2", "weight_class": "Assault", "tonnage": 100, "bv2": 2481},
+    ]
+
+    return {
+        "available_factions": [
+            {
+                "faction": "Draconis Combine",
+                "display_name": "Draconis Combine",
+                "description": "Синдикат Дракона",
+                "available_rat_mechs": default_mechs
+            },
+            {
+                "faction": "Federated Suns",
+                "display_name": "Federated Suns",
+                "description": "Федеративные Солнца",
+                "available_rat_mechs": default_mechs
+            },
+            {
+                "faction": "Raven Alliance",
+                "display_name": "Raven Alliance",
+                "description": "Вороний Альянс",
+                "available_rat_mechs": default_mechs
+            },
+            {
+                "faction": "Clan Sea Fox",
+                "display_name": "Clan Sea Fox",
+                "description": "Клан Морских Лис",
+                "available_rat_mechs": default_mechs
+            },
+            {
+                "faction": "Republic of the Sphere",
+                "display_name": "Republic of the Sphere",
+                "description": "Республика Сферы",
+                "available_rat_mechs": default_mechs
+            },
+            {
+                "faction": "Mercenary",
+                "display_name": "Mercenary",
+                "description": "Независимые наемники",
+                "available_rat_mechs": default_mechs
+            }
+        ],
+        "max_starting_mechs": 2,
+        "max_starting_bv2": 3000,
+        "starting_sp": 3000,
+        "starting_reputation": 1,
+        "starting_pilots_count": 2,
+        "starting_xp_per_pilot": 150
+    }
+
+
+@router.get("/me", response_model=List[ForceResponse], summary="Получение всех отрядов текущего пользователя")
+async def get_my_forces(
+    current_user: UserModel = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Возвращает список всех отрядов авторизованного пользователя."""
+    stmt = (
+        select(ForceModel)
+        .where(ForceModel.owner_id == current_user.id)
+        .options(selectinload(ForceModel.units), selectinload(ForceModel.pilots))
+        .order_by(ForceModel.id.desc())
+    )
+    result = await db.execute(stmt)
+    forces = result.scalars().all()
+
+    if not forces:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="У текущего пользователя еще нет созданного отряда"
+        )
+    return forces
+
+
+@router.post("/", response_model=ForceResponse, status_code=status.HTTP_201_CREATED, summary="Создание нового отряда")
+async def create_force(
+    force_in: ForceCreate,
+    current_user: UserModel = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Создает новый отряд наемников для авторизованного пользователя."""
+    return await ForceService.create_force(db=db, owner_id=current_user.id, force_in=force_in)
+
+
+@router.get("/{force_id}", response_model=ForceResponse, summary="Получение карточки отряда")
+async def get_force(
+    force_id: str = Path(..., min_length=3, description="UUID отряда"),
+    force: ForceModel = Depends(verify_force_ownership)
+):
+    """Возвращает полную структуру отряда с подгруженными списками техники и пилотов."""
+    return force
+
+@router.delete("/{force_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Удаление отряда")
+async def delete_force(
+    force_id: str = Path(..., min_length=3),
+    force: ForceModel = Depends(verify_force_ownership),
+    db: AsyncSession = Depends(get_db)
+):
+    """Каскадно удаляет отряд пользователя со всей связанной техникой и пилотами."""
+    await ForceService.delete_force(db=db, force=force)
+    return None
+
+@router.post("/{force_id}/assign-pilot", response_model=ForceResponse, summary="Назначение пилота на мех")
+async def assign_pilot(
+    request: AssignPilotRequest,
+    force_id: str = Path(..., min_length=3),
+    force: ForceModel = Depends(verify_force_ownership),
+    db: AsyncSession = Depends(get_db)
+):
+    """Назначает или снимает пилота с техники в СУБД."""
+    try:
+        return await ForceService.assign_pilot_to_unit(
+            db=db, force=force, unit_id=request.unit_id, pilot_id=request.pilot_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+
+@router.get("/{force_id}/export", summary="Экспорт Mercenary Force Record Sheet")
+async def export_force_record_sheet(
+    force_id: str = Path(..., min_length=3),
+    force: ForceModel = Depends(verify_force_ownership)
+):
+    """Генерирует и возвращает официальный бланк отряда в формате JSON."""
+    record_sheet = {
+        "unit_name": force.name,
+        "sponsoring_faction": force.sponsoring_faction,
+        "warchest_sp": force.support_points,
+        "reputation_score": force.reputation_score,
+        "total_units_count": len(force.units),
+        "total_pilots_count": len(force.pilots),
+        "roster": [
+            {
+                "id": u.id,
+                "chassis": u.chassis,
+                "model": u.model,
+                "tonnage": u.tonnage,
+                "weight_class": u.weight_class,
+                "bv2": u.bv2,
+                "status": u.status,
+                "assigned_pilot_id": u.assigned_pilot_id
+            } for u in force.units
+        ],
+        "pilots": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "gunnery": p.gunnery,
+                "piloting": p.piloting,
+                "experience_points": p.experience_points,
+                "edge_points": p.edge_points
+            } for p in force.pilots
+        ]
+    }
+    return JSONResponse(
+        content=jsonable_encoder(record_sheet),
+        headers={"Content-Disposition": f"attachment; filename={force.name}_record_sheet.json"}
+    )
+
+@router.post("/{force_id}/roster/import", response_model=ForceResponse, summary="Импорт ростера из JSON файла")
+async def import_force_roster(
+    file: UploadFile = File(...),
+    force_id: str = Path(..., min_length=3),
+    force: ForceModel = Depends(verify_force_ownership),
+    db: AsyncSession = Depends(get_db)
+):
+    """Пакетно загружает список мехов и пилотов из загруженного файла."""
+    content = await file.read()
+    try:
+        data = json.loads(content)
+        for unit_data in data.get("units", []):
+            unit = MechUnitModel(
+                force_id=force.id,
+                chassis=unit_data["chassis"],
+                model=unit_data["model"],
+                tonnage=unit_data["tonnage"],
+                weight_class=unit_data["weight_class"],
+                bv2=unit_data["bv2"]
+            )
+            db.add(unit)
+
+        for pilot_data in data.get("pilots", []):
+            pilot = PilotModel(
+                force_id=force.id,
+                name=pilot_data["name"],
+                gunnery=pilot_data.get("gunnery", 4),
+                piloting=pilot_data.get("piloting", 5)
+            )
+            db.add(pilot)
+
+        await db.flush()
+        return force
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Ошибка парсинга файла: {str(e)}")
+````
+
+## File: app/db/models/force.py
+````python
+import uuid
+from typing import List, Optional
+from sqlalchemy import String, Integer, ForeignKey, Enum as SQLEnum
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.db.database import Base
+from app.schemas.force import Faction, UnitStatus, WeightClass
+
+
+class ForceModel(Base):
+    __tablename__ = "forces"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    sponsoring_faction: Mapped[Faction] = mapped_column(SQLEnum(Faction), nullable=False)
+    
+    # Единый экономический баланс SP (Warchest) — стартовое значение 3000 SP
+    support_points: Mapped[int] = mapped_column(Integer, default=3000, nullable=False)
+    
+    # Стартовая репутация отряда — значение 1
+    reputation_score: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    owner: Mapped["UserModel"] = relationship(
+        "UserModel", 
+        back_populates="forces"
+        )
+    units: Mapped[List["MechUnitModel"]] = relationship(
+        "MechUnitModel", 
+        back_populates="force", 
+        cascade="all, delete-orphan"
+        )
+    pilots: Mapped[List["PilotModel"]] = relationship(
+        "PilotModel", 
+        back_populates="force", 
+        cascade="all, delete-orphan"
+        )
+
+
+class MechUnitModel(Base):
+    __tablename__ = "mech_units"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    force_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("forces.id", ondelete="CASCADE"), nullable=True)
+    chassis: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str] = mapped_column(String(50), nullable=False)
+    tonnage: Mapped[int] = mapped_column(Integer, nullable=False)
+    weight_class: Mapped[WeightClass] = mapped_column(SQLEnum(WeightClass), nullable=False)
+    bv2: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[UnitStatus] = mapped_column(SQLEnum(UnitStatus), default=UnitStatus.OPERATIONAL)
+    assigned_pilot_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("pilots.id", ondelete="SET NULL"), nullable=True)
+
+    force: Mapped[Optional["ForceModel"]] = relationship(
+        "ForceModel", 
+        back_populates="units"
+        )
+````
+
+## File: app/db/models/pilot.py
+````python
+import uuid
+from typing import List, Optional
+from sqlalchemy import String, Integer, Boolean, ForeignKey, JSON
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from app.db.database import Base
+
+
+class PilotModel(Base):
+    __tablename__ = "pilots"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    force_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("forces.id", ondelete="CASCADE"), nullable=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    gunnery: Mapped[int] = mapped_column(Integer, default=4)
+    piloting: Mapped[int] = mapped_column(Integer, default=5)
+    
+    # Стартовый запас опыта у пилотов — 150 XP
+    experience_points: Mapped[int] = mapped_column(Integer, default=150)
+    total_xp_earned: Mapped[int] = mapped_column(Integer, default=150)
+    
+    edge_points: Mapped[int] = mapped_column(Integer, default=1)
+    special_abilities: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
+
+    is_temporary_hire: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    force: Mapped[Optional["ForceModel"]] = relationship("ForceModel", back_populates="pilots")
 ````
 
 ## File: frontend/src/api/services.ts
@@ -10426,52 +10770,6 @@ export const DashboardPage: React.FC = () => {
 };
 ````
 
-## File: .gitignore
-````
-# Python files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-*.pyc
-.pytest_cache/
-*.db
-*.sqlite
-*.sqlite3
-
-# Virtual environments
-.venv
-.env
-.db
-
-# Logs
-logs
-*.log
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
-lerna-debug.log*
-
-node_modules
-dist
-dist-ssr
-*.local
-
-# Editor directories and files
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-````
-
 ## File: pyproject.toml
 ````toml
 [project]
@@ -10513,74 +10811,33 @@ package = false
 
 ## File: README.md
 ````markdown
-# ⚔️ Chaos Campaign Manager (Draconis Reach)
+# Chaos Campaign Manager (Draconis Reach)
 
-**Chaos Campaign Manager** — это веб-сервис и REST API для автоматизации ведения наемнических отрядов в настольной стратегической игре **BattleTech Classic** (по правилам *Hot Spots: Draconis Reach* и системе *Chaos Campaign: Mercenaries*).
+**Chaos Campaign Manager** — это веб-сервис и REST API для автоматизации ведения расчетов кампаний в настольной игре **Classic BattleTech** (по правилам *Hot Spots: Draconis Reach* и системе *Chaos Campaign: Mercenaries*).
 
-Сервис берет на себя всю рутину командира: отслеживание состояния боевой техники и пилотов, учет финансово-материальных ресурсов, проведение контрактов, ремонт и утилизацию лома.
-
----
-
-## 🚀 Основные возможности
-
-* **Архитектура Command Hub (Multi-Force):** Возможность владеть и одновременно управлять несколькими наемническими отрядами в одном аккаунте ($1 \rightarrow N$).
-
-
-* **Единая экономика Support Points (SP):** Унифицированная финансовая система — покупка и ремонт мехов, вступительные взносы за миссии, оплата контрактов и конвертация в XP рассчитываются строго в SP.
-
-
-* **Прокачка и управление пилотами:** Нелинейный расчет стоимости улучшения навыков (Gunnery/Piloting), Edge и специальных способностей (SPA).
-
-
-* **Контракты и переговоры:** Генерация контрактов с учетом репутации отряда, гибкие условия выплат и командных прав.
-
-
-* **Проведение миссий (Tracks):** Ввод итогов боя, отслеживание потерь/повреждений, распределение XP и наград, а также скрап уничтоженных мехов (возврат 25% стоимости в SP).
-
-
-* **Логистика и RAT:** Генерация случайного состава техники по таблицам назначения (*Random Assignment Tables — RAT*) выбранной фракции и ремонтный док.
-
-
-* **Экспорт документов:** Скачивание официальных листов отряда (*Mercenary Force Record Sheet*) в формате JSON.
-
-
+Сервис полностью избавляет от необходимости вручную заполнять бумажные бланки и вести учет в электронных таблицах. Он автоматизирует отслеживание состояния боевой техники и пилотов, учет финансово-материальных ресурсов, проведение контрактов, ремонт, утилизацию и покупку мехов.
 
 ---
 
 ## 🛠 Технологический стек
 
 ### Backend
-
 * **Python 3.11+** / **FastAPI**
-
-* **SQLAlchemy 2.0 (Async)** + `asyncpg` / `aiosqlite`
-
-* **Pydantic v2** (DTO с валидацией стартового состава и BV2)
-
-
-* **Alembic** (управление миграциями БД)
-
-
-* **OAuth2 + JWT** (аутентификация пользователей)
-
-
+* **PostgreSQL 16** (Production/Docker) + `asyncpg` / **SQLite** (`aiosqlite` в Dev/Test)
+* **SQLAlchemy 2.0 (Async)** + **Alembic** (асинхронный ORM и миграции схемы БД)
+* **Pydantic v2** (DTO-схемы с кастомной валидацией $BV2 \le 3000$ и лимитов)
+* **OAuth2 + JWT** (`PyJWT`, `passlib[bcrypt]`)
 * **uv** (высокопроизводительный менеджер пакетов Python)
 
-
-
 ### Frontend
-
 * **React 18** + **Vite**
-
 * **TypeScript 5.0+**
-
-* **TanStack Query v5 (React Query)** + **Zustand 4**
-
+* **Zustand 4** (глобальное состояние авторизации и отрядов) + **TanStack Query v5** (серверный кэш)
 * **Tailwind CSS** + **Radix UI / Shadcn UI**
+* **Axios** (с авторизационным Interceptor и префиксом API `/api/v1`)
 
-* **Axios** (с JWT Interceptor)
-
-
+### Инфраструктура
+* **Docker** & **Docker Compose** (многоконтейнерное развертывание: Database + Backend + Frontend/Nginx)
 
 ---
 
@@ -10588,61 +10845,89 @@ package = false
 
 ```text
 chaos_campaign_api/
-├── app/                      # FastAPI Backend приложение[cite: 3, 5]
-│   ├── api/v1/               # REST API роутеры (auth, forces, pilots, contracts, tracks, logistics)[cite: 1, 3]
-│   ├── core/                 # Безопасность, исключения и логирование[cite: 1, 3]
-│   ├── db/                   # Модели SQLAlchemy, сессии и JSON-справочники RAT[cite: 1, 3]
-│   ├── schemas/              # Pydantic v2 DTO модели[cite: 1, 3]
-│   └── services/             # Бизнес-логика правил BattleTech[cite: 1, 3]
-├── frontend/                 # React + TypeScript SPA приложение[cite: 2, 5]
-├── alembic/                  # Миграции структуры базы данных[cite: 1, 3]
-├── docs/                     # Технические спецификации[cite: 5]
-└── pyproject.toml            # Конфигурация проекта и зависимостей[cite: 1, 3, 5]
-
+├── app/                        # Backend приложения на FastAPI
+│   ├── api/v1/                 # REST API маршруты (auth, forces, pilots, contracts, tracks, logistics)
+│   ├── core/                   # JWT, хеширование паролей, логирование и кастомные исключения
+│   ├── db/                     # ORM-модели SQLAlchemy, подключение к СУБД и seed-данные RAT
+│   │   ├── data/factions_rat.json # Динамический JSON справочник фракций и RAT
+│   │   └── models/             # Модели UserModel, ForceModel, PilotModel, MechUnitModel и др.
+│   ├── schemas/                # Pydantic v2 DTO модели валидации
+│   ├── services/               # Бизнес-логика (калькулятор XP, переговоры, логистика, треки)
+│   ├── config.py               # Конфигурация приложения (Pydantic Settings)
+│   └── main.py                 # Точка входа: FastAPI app, lifespan, CORS и обработчики ошибок
+├── frontend/                   # Frontend SPA приложение на React
+│   ├── src/
+│   │   ├── api/                # Axios-клиент c JWT interceptor и сервисы вызов API
+│   │   ├── components/         # Radix / Shadcn UI компоненты (отряды, пилоты, логистика)
+│   │   ├── pages/              # Страницы (Auth, Command Hub, Dashboard, Logistics, Hub)
+│   │   ├── store/              # Состояние Zustand (authStore, forceStore)
+│   │   └── types/              # TypeScript интерфейсы и DTO-типы
+│   ├── nginx.conf              # Nginx конфигурация для Docker frontend
+│   └── Dockerfile              # Сборка фронтенда в Nginx контейнере
+├── alembic/                    # Скрипты и истории миграций СУБД
+├── docs/                       # Паспорта проекта, архитектуры и спецификации
+├── docker-compose.yml          # Многоконтейнерный запуск (PostgreSQL + FastAPI + Frontend)
+├── Dockerfile                  # Dockerfile бэкенда
+└── pyproject.toml              # Управление зависимостями Python (uv)
 ```
 
 ---
 
 ## 💻 Быстрый запуск
 
-### 1. Клонирование репозитория
+### Вариант 1. Запуск через Docker Compose (Рекомендуемый)
+
+Для полного запуска всей инфраструктуры (СУБД PostgreSQL 16, бэкенд FastAPI и фронтенд Nginx) одной командой:
 
 ```bash
+# Клонирование репозитория
 git clone https://github.com/MileshkinMaksim/chaos_campaign_api.git
 cd chaos_campaign_api
 
+# Запуск в фоновом режиме со сборкой контейнеров
+docker compose up -d --build
 ```
 
-### 2. Запуск Backend (FastAPI)
+При старте контейнер FastAPI автоматически создаст необходимые таблицы в PostgreSQL через `lifespan` и загрузит справочники из `factions_rat.json`.
 
-Проект использует менеджер пакетов `uv`:
+* **Веб-интерфейс (Frontend):** `http://localhost` (порт 80)
+* **Swagger UI (Backend API):** `http://localhost:8000/docs`
+
+Для остановки контейнеров:
+```bash
+docker compose down
+```
+
+---
+
+### Вариант 2. Локальная разработка (Без Docker)
+
+#### 1. Запуск Backend (FastAPI + SQLite/aiosqlite)
 
 ```bash
-# Установка зависимостей
+# Установка зависимостей с помощью uv
 uv sync
 
-# Применение миграций базы данных
+# Применение миграций базы данных Alembic
 uv run alembic upgrade head
 
-# Запуск веб-сервера разработки
+# Запуск dev-сервера Uvicorn
 uv run uvicorn app.main:app --reload
-
 ```
 
 * **API доступен по адресу:** `http://localhost:8000`
-* **Swagger UI документация:** `http://localhost:8000/docs`
+* **Интерактивная документация:** `http://localhost:8000/docs`
 
-### 3. Запуск Frontend (React)
+#### 2. Запуск Frontend (React + Vite)
 
 ```bash
 cd frontend
 
-# Установка зависимостей
+# Установка зависимостей Node.js
 npm install
 
-# Запуск dev-сервера Vite
+# Запуск сервера разработки Vite
 npm run dev
-
 ```
 
 * **Интерфейс доступен по адресу:** `http://localhost:5173`
@@ -10653,406 +10938,28 @@ npm run dev
 
 | Раздел | Эндпоинт | Метод | Описание |
 | --- | --- | --- | --- |
-| **Auth** | `/api/v1/auth/register` | `POST` | Регистрация нового командира
-
- |
-| **Auth** | `/api/v1/auth/token` | `POST` | Авторизация и получение JWT-токена
-
- |
-| **Forces** | `/api/v1/forces/me` | `GET` | Получение списка всех отрядов пользователя
-
- |
-| **Forces** | `/api/v1/forces/` | `POST` | Создание нового отряда наемников
-
- |
-| **Forces** | `/api/v1/forces/{id}` | `DELETE` | Каскадное удаление (расформирование) отряда
-
- |
-| **Pilots** | `/api/v1/pilots/{id}/upgrade` | `POST` | Прокачка навыков и очков пилота за XP
-
- |
-| **Contracts** | `/api/v1/contracts/available` | `GET` | Поиск доступных контрактов
-
- |
-| **Tracks** | `/api/v1/tracks/{id}/complete` | `POST` | Завершение миссии, расчет наград и конвертация SP $\rightarrow$ XP
-
- |
-| **Logistics** | `/api/v1/logistics/repair` | `POST` | Ремонт поврежденной техники за SP
-
- |
+| **Auth** | `/api/v1/auth/register` | `POST` | Регистрация нового командира |
+| **Auth** | `/api/v1/auth/token` | `POST` | Авторизация и получение JWT-токена |
+| **Forces** | `/api/v1/forces/starting-options` | `GET` | Получение списка доступных фракций и стартовых RAT из JSON |
+| **Forces** | `/api/v1/forces/me` | `GET` | Получение всех отрядов текущего пользователя |
+| **Forces** | `/api/v1/forces/` | `POST` | Создание нового отряда с валидацией состава |
+| **Forces** | `/api/v1/forces/{id}` | `DELETE` | Каскадное расформирование отряда со всеми пилотами и мехами |
+| **Forces** | `/api/v1/forces/{id}/export` | `GET` | Экспорт листа отряда (*Record Sheet*) в формате JSON |
+| **Forces** | `/api/v1/forces/{id}/assign-pilot` | `POST` | Привязка или отвязка пилота от меха |
+| **Pilots** | `/api/v1/pilots/{id}/upgrade` | `POST` | Улучшение навыков (*Gunnery/Piloting*), *Edge* или *SPA* за XP |
+| **Contracts** | `/api/v1/contracts/available` | `GET` | Поиск и фильтрация доступных контрактов |
+| **Contracts** | `/api/v1/contracts/{id}/negotiate` | `POST` | Изменение условий контракта с учетом репутации |
+| **Tracks** | `/api/v1/tracks/{id}/complete` | `POST` | Фиксация итогов боя, изменение статуса мехов, начисление SP и XP |
+| **Logistics** | `/api/v1/logistics/repair` | `POST` | Ремонт поврежденной техники за SP |
+| **Logistics** | `/api/v1/logistics/rat-roll` | `GET` | Генерация случайной техники по таблицам RAT выбранной фракции |
+| **Logistics** | `/api/v1/logistics/buy-unit` | `POST` | Покупка выбранного меха за SP |
+| **Logistics** | `/api/v1/logistics/scrap` | `POST` | Списание/утилизация техники с возвратом доли стоимости в SP |
 
 ---
 
 ## 📄 Лицензия
 
 Проект распространяется под лицензией MIT.
-````
-
-## File: app/api/v1/endpoints/forces.py
-````python
-import json
-from typing import Any, Dict, List
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, UploadFile, status
-from fastapi.responses import JSONResponse
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-
-from app.db.database import get_db
-from app.db.models.force import ForceModel, MechUnitModel
-from app.db.models.pilot import PilotModel
-from app.db.models.user import UserModel
-from app.dependencies.auth import get_current_user
-from app.dependencies.campaign import verify_force_ownership
-from app.schemas.force import AssignPilotRequest, ForceCreate, ForceResponse
-from app.services.force_service import ForceService
-from fastapi.encoders import jsonable_encoder
-
-router = APIRouter()
-
-
-@router.get("/starting-options", response_model=Dict[str, Any], summary="Получение стартовых опций для создания отряда")
-async def get_starting_options():
-    """Возвращает список доступных фракций с их описанием и RAT-мехами."""
-    default_mechs = [
-        {"chassis": "Flea", "model": "FLE-17", "weight_class": "Light", "tonnage": 20, "bv2": 510},
-        {"chassis": "Flea", "model": "FLE-21", "weight_class": "Light", "tonnage": 20, "bv2": 826},
-        {"chassis": "Chameleon", "model": "CLN-7V", "weight_class": "Medium", "tonnage": 50, "bv2": 1042},
-        {"chassis": "Quickdraw", "model": "QKD-5M", "weight_class": "Heavy", "tonnage": 60, "bv2": 1237},
-        {"chassis": "Ostsol", "model": "OTL-5M", "weight_class": "Heavy", "tonnage": 60, "bv2": 1245},
-        {"chassis": "Chameleon", "model": "CLN-8V", "weight_class": "Medium", "tonnage": 50, "bv2": 1426},
-        {"chassis": "Starslayer", "model": "STY-3C", "weight_class": "Medium", "tonnage": 50, "bv2": 1508},
-        {"chassis": "Ostsol", "model": "OTL-8E", "weight_class": "Heavy", "tonnage": 60, "bv2": 1552},
-        {"chassis": "Caesar", "model": "CES-3R", "weight_class": "Heavy", "tonnage": 70, "bv2": 1578},
-        {"chassis": "Caesar", "model": "CES-5R", "weight_class": "Heavy", "tonnage": 70, "bv2": 2192},
-        {"chassis": "Starslayer", "model": "STY-4C", "weight_class": "Medium", "tonnage": 50, "bv2": 2218},
-        {"chassis": "Quickdraw", "model": "QKD-9G", "weight_class": "Heavy", "tonnage": 60, "bv2": 2224},
-        {"chassis": "Devastator", "model": "DVS-2", "weight_class": "Assault", "tonnage": 100, "bv2": 2481},
-    ]
-
-    return {
-        "available_factions": [
-            {
-                "faction": "Draconis Combine",
-                "display_name": "Draconis Combine",
-                "description": "Синдикат Дракона",
-                "available_rat_mechs": default_mechs
-            },
-            {
-                "faction": "Federated Suns",
-                "display_name": "Federated Suns",
-                "description": "Федеративные Солнца",
-                "available_rat_mechs": default_mechs
-            },
-            {
-                "faction": "Raven Alliance",
-                "display_name": "Raven Alliance",
-                "description": "Вороний Альянс",
-                "available_rat_mechs": default_mechs
-            },
-            {
-                "faction": "Clan Sea Fox",
-                "display_name": "Clan Sea Fox",
-                "description": "Клан Морских Лис",
-                "available_rat_mechs": default_mechs
-            },
-            {
-                "faction": "Republic of the Sphere",
-                "display_name": "Republic of the Sphere",
-                "description": "Республика Сферы",
-                "available_rat_mechs": default_mechs
-            },
-            {
-                "faction": "Mercenary",
-                "display_name": "Mercenary",
-                "description": "Независимые наемники",
-                "available_rat_mechs": default_mechs
-            }
-        ],
-        "max_starting_mechs": 2,
-        "max_starting_bv2": 3000,
-        "starting_sp": 3000,
-        "starting_reputation": 1,
-        "starting_pilots_count": 2,
-        "starting_xp_per_pilot": 150
-    }
-
-
-@router.get("/me", response_model=List[ForceResponse], summary="Получение всех отрядов текущего пользователя")
-async def get_my_forces(
-    current_user: UserModel = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Возвращает список всех отрядов авторизованного пользователя."""
-    stmt = (
-        select(ForceModel)
-        .where(ForceModel.owner_id == current_user.id)
-        .options(selectinload(ForceModel.units), selectinload(ForceModel.pilots))
-        .order_by(ForceModel.id.desc())
-    )
-    result = await db.execute(stmt)
-    forces = result.scalars().all()
-
-    if not forces:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="У текущего пользователя еще нет созданного отряда"
-        )
-    return forces
-
-
-@router.post("/", response_model=ForceResponse, status_code=status.HTTP_201_CREATED, summary="Создание нового отряда")
-async def create_force(
-    force_in: ForceCreate,
-    current_user: UserModel = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
-):
-    """Создает новый отряд наемников для авторизованного пользователя."""
-    return await ForceService.create_force(db=db, owner_id=current_user.id, force_in=force_in)
-
-
-@router.get("/{force_id}", response_model=ForceResponse, summary="Получение карточки отряда")
-async def get_force(
-    force_id: str = Path(..., min_length=3, description="UUID отряда"),
-    force: ForceModel = Depends(verify_force_ownership)
-):
-    """Возвращает полную структуру отряда с подгруженными списками техники и пилотов."""
-    return force
-
-@router.delete("/{force_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Удаление отряда")
-async def delete_force(
-    force_id: str = Path(..., min_length=3),
-    force: ForceModel = Depends(verify_force_ownership),
-    db: AsyncSession = Depends(get_db)
-):
-    """Каскадно удаляет отряд пользователя со всей связанной техникой и пилотами."""
-    await ForceService.delete_force(db=db, force=force)
-    return None
-
-@router.post("/{force_id}/assign-pilot", response_model=ForceResponse, summary="Назначение пилота на мех")
-async def assign_pilot(
-    request: AssignPilotRequest,
-    force_id: str = Path(..., min_length=3),
-    force: ForceModel = Depends(verify_force_ownership),
-    db: AsyncSession = Depends(get_db)
-):
-    """Назначает или снимает пилота с техники в СУБД."""
-    try:
-        return await ForceService.assign_pilot_to_unit(
-            db=db, force=force, unit_id=request.unit_id, pilot_id=request.pilot_id
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-
-@router.get("/{force_id}/export", summary="Экспорт Mercenary Force Record Sheet")
-async def export_force_record_sheet(
-    force_id: str = Path(..., min_length=3),
-    force: ForceModel = Depends(verify_force_ownership)
-):
-    """Генерирует и возвращает официальный бланк отряда в формате JSON."""
-    record_sheet = {
-        "unit_name": force.name,
-        "sponsoring_faction": force.sponsoring_faction,
-        "warchest_sp": force.support_points,
-        "reputation_score": force.reputation_score,
-        "total_units_count": len(force.units),
-        "total_pilots_count": len(force.pilots),
-        "roster": [
-            {
-                "id": u.id,
-                "chassis": u.chassis,
-                "model": u.model,
-                "tonnage": u.tonnage,
-                "weight_class": u.weight_class,
-                "bv2": u.bv2,
-                "status": u.status,
-                "assigned_pilot_id": u.assigned_pilot_id
-            } for u in force.units
-        ],
-        "pilots": [
-            {
-                "id": p.id,
-                "name": p.name,
-                "gunnery": p.gunnery,
-                "piloting": p.piloting,
-                "experience_points": p.experience_points,
-                "edge_points": p.edge_points
-            } for p in force.pilots
-        ]
-    }
-    return JSONResponse(
-        content=jsonable_encoder(record_sheet),
-        headers={"Content-Disposition": f"attachment; filename={force.name}_record_sheet.json"}
-    )
-
-@router.post("/{force_id}/roster/import", response_model=ForceResponse, summary="Импорт ростера из JSON файла")
-async def import_force_roster(
-    file: UploadFile = File(...),
-    force_id: str = Path(..., min_length=3),
-    force: ForceModel = Depends(verify_force_ownership),
-    db: AsyncSession = Depends(get_db)
-):
-    """Пакетно загружает список мехов и пилотов из загруженного файла."""
-    content = await file.read()
-    try:
-        data = json.loads(content)
-        for unit_data in data.get("units", []):
-            unit = MechUnitModel(
-                force_id=force.id,
-                chassis=unit_data["chassis"],
-                model=unit_data["model"],
-                tonnage=unit_data["tonnage"],
-                weight_class=unit_data["weight_class"],
-                bv2=unit_data["bv2"]
-            )
-            db.add(unit)
-
-        for pilot_data in data.get("pilots", []):
-            pilot = PilotModel(
-                force_id=force.id,
-                name=pilot_data["name"],
-                gunnery=pilot_data.get("gunnery", 4),
-                piloting=pilot_data.get("piloting", 5)
-            )
-            db.add(pilot)
-
-        await db.flush()
-        return force
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Ошибка парсинга файла: {str(e)}")
-````
-
-## File: app/db/models/force.py
-````python
-import uuid
-from typing import List, Optional
-from sqlalchemy import String, Integer, ForeignKey, Enum as SQLEnum
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from app.db.database import Base
-from app.schemas.force import Faction, UnitStatus, WeightClass
-
-
-class ForceModel(Base):
-    __tablename__ = "forces"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    owner_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    name: Mapped[str] = mapped_column(String(100), nullable=False)
-    sponsoring_faction: Mapped[Faction] = mapped_column(SQLEnum(Faction), nullable=False)
-    
-    # Единый экономический баланс SP (Warchest) — стартовое значение 3000 SP
-    support_points: Mapped[int] = mapped_column(Integer, default=3000, nullable=False)
-    
-    # Стартовая репутация отряда — значение 1
-    reputation_score: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
-
-    owner: Mapped["UserModel"] = relationship(
-        "UserModel", 
-        back_populates="forces"
-        )
-    units: Mapped[List["MechUnitModel"]] = relationship(
-        "MechUnitModel", 
-        back_populates="force", 
-        cascade="all, delete-orphan"
-        )
-    pilots: Mapped[List["PilotModel"]] = relationship(
-        "PilotModel", 
-        back_populates="force", 
-        cascade="all, delete-orphan"
-        )
-
-
-class MechUnitModel(Base):
-    __tablename__ = "mech_units"
-
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
-    force_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("forces.id", ondelete="CASCADE"), nullable=True)
-    chassis: Mapped[str] = mapped_column(String(50), nullable=False)
-    model: Mapped[str] = mapped_column(String(50), nullable=False)
-    tonnage: Mapped[int] = mapped_column(Integer, nullable=False)
-    weight_class: Mapped[WeightClass] = mapped_column(SQLEnum(WeightClass), nullable=False)
-    bv2: Mapped[int] = mapped_column(Integer, nullable=False)
-    status: Mapped[UnitStatus] = mapped_column(SQLEnum(UnitStatus), default=UnitStatus.OPERATIONAL)
-    assigned_pilot_id: Mapped[Optional[str]] = mapped_column(String(36), ForeignKey("pilots.id", ondelete="SET NULL"), nullable=True)
-
-    force: Mapped[Optional["ForceModel"]] = relationship(
-        "ForceModel", 
-        back_populates="units"
-        )
-````
-
-## File: app/main.py
-````python
-import time
-from fastapi import FastAPI, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from app.config import settings
-from app.core.exceptions import (
-    InsufficientXPError,
-    InsufficientSupportPointsError,
-    ReputationRequirementNotMetError,
-    InvalidStartingForceConfigError,
-)
-from app.api.v1.api import api_router
-
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version=settings.VERSION,
-    openapi_url=f"{settings.API_V1_STR}/openapi.json",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost", "http://localhost:80", "http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.middleware("http")
-async def add_process_time_header(request: Request, call_next):
-    start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    response.headers["X-Process-Time"] = str(process_time)
-    return response
-
-
-@app.exception_handler(InsufficientXPError)
-async def insufficient_xp_handler(request: Request, exc: InsufficientXPError):
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"detail": exc.message, "error_code": "INSUFFICIENT_XP"}
-    )
-
-
-@app.exception_handler(InsufficientSupportPointsError)
-async def insufficient_sp_handler(request: Request, exc: InsufficientSupportPointsError):
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"detail": exc.message, "error_code": "INSUFFICIENT_SUPPORT_POINTS"}
-    )
-
-
-@app.exception_handler(ReputationRequirementNotMetError)
-async def reputation_handler(request: Request, exc: ReputationRequirementNotMetError):
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"detail": exc.message, "error_code": "REPUTATION_REQUIREMENT_NOT_MET"}
-    )
-
-
-@app.exception_handler(InvalidStartingForceConfigError)
-async def invalid_force_handler(request: Request, exc: InvalidStartingForceConfigError):
-    return JSONResponse(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        content={"detail": exc.message, "error_code": "INVALID_STARTING_FORCE_CONFIG"}
-    )
-
-
-app.include_router(api_router, prefix=settings.API_V1_STR)
 ````
 
 ## File: app/services/force_service.py
@@ -11159,4 +11066,90 @@ class ForceService:
         """Каскадно удаляет отряд и все связанные записи (юниты, пилоты)."""
         await db.delete(force)
         await db.commit()
+````
+
+## File: app/main.py
+````python
+import time
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from app.config import settings
+from app.db.database import engine, Base
+from app.core.exceptions import (
+    InsufficientXPError,
+    InsufficientSupportPointsError,
+    ReputationRequirementNotMetError,
+    InvalidStartingForceConfigError,
+)
+from app.api.v1.api import api_router
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    openapi_url=f"{settings.API_V1_STR}/openapi.json",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost", 
+                   "http://localhost:80", 
+                   "http://localhost:5173",
+                   "http://127.0.0.1", 
+                   "http://127.0.0.1:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
+
+
+@app.exception_handler(InsufficientXPError)
+async def insufficient_xp_handler(request: Request, exc: InsufficientXPError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": exc.message, "error_code": "INSUFFICIENT_XP"}
+    )
+
+
+@app.exception_handler(InsufficientSupportPointsError)
+async def insufficient_sp_handler(request: Request, exc: InsufficientSupportPointsError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": exc.message, "error_code": "INSUFFICIENT_SUPPORT_POINTS"}
+    )
+
+
+@app.exception_handler(ReputationRequirementNotMetError)
+async def reputation_handler(request: Request, exc: ReputationRequirementNotMetError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": exc.message, "error_code": "REPUTATION_REQUIREMENT_NOT_MET"}
+    )
+
+
+@app.exception_handler(InvalidStartingForceConfigError)
+async def invalid_force_handler(request: Request, exc: InvalidStartingForceConfigError):
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"detail": exc.message, "error_code": "INVALID_STARTING_FORCE_CONFIG"}
+    )
+
+
+app.include_router(api_router, prefix=settings.API_V1_STR)
 ````
