@@ -97,3 +97,31 @@ export interface StartingOptionsResponse {
   starting_pilots_count: number;
   starting_xp_per_pilot: number;
 }
+
+export interface NamedPilot {
+  id: string;
+  force_id?: string | null;
+  name: string;
+  gunnery: number; 
+  piloting: number; 
+  experience_points: number;
+  total_xp_earned: number;
+  edge_points: number;
+  special_abilities: string[];
+  is_temporary_hire: boolean;
+}
+
+export type SkillUpgrade = {
+  upgrade_type: "gunnery" | "piloting";
+};
+
+export type EdgeUpgrade = {
+  upgrade_type: "edge";
+};
+
+export type AbilityUpgrade = {
+  upgrade_type: "ability";
+  ability_name: string;
+};
+
+export type PilotUpgradeRequest = SkillUpgrade | EdgeUpgrade | AbilityUpgrade;

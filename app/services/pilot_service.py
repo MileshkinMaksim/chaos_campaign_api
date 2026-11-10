@@ -1,5 +1,6 @@
 from typing import List
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
 from app.core.exceptions import InsufficientXPError
 from app.db.models.pilot import PilotModel
 from app.schemas.pilot import (
@@ -61,17 +62,29 @@ class PilotService:
             pilot.edge_points += 1
 
         elif isinstance(request, AbilityUpgrade):
-            # Расчет стоимости очередной спец-способности (SPA)
-            current_abilities_count = len(getattr(pilot, "special_abilities", []))
-            ability_index = min(current_abilities_count, len(SPA_COST_TABLE) - 1)
+            ability_name = request.ability_name.strip()
+            if not ability_name:
+                raise ValueError("Название способности не может быть пустым")
+
+            current_abilities = list(getattr(pilot, "special_abilities", []) or [])
+            if len(current_abilities) >= 5:
+                raise ValueError("Достигнут лимит в 5 специальных способностей")
+
+            if ability_name in current_abilities:
+                raise ValueError("Эта способность уже изучена пилотом")
+
+            ability_index = min(len(current_abilities), len(SPA_COST_TABLE) - 1)
             cost = SPA_COST_TABLE[ability_index]
-            
+
             if pilot.experience_points < cost:
                 raise InsufficientXPError(required=cost, available=pilot.experience_points)
-            
+
             pilot.experience_points -= cost
-            # Примечание: подробный список спец-способностей сохраняется в связных таблицах или JSON
-            
+            current_abilities.append(ability_name)
+            pilot.special_abilities = current_abilities
+            flag_modified(pilot, "special_abilities")
+
         db.add(pilot)
-        await db.flush()
+        await db.commit()
+        await db.refresh(pilot)
         return pilot

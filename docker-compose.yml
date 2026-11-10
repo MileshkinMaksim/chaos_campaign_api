@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  # 1. База данных PostgreSQL
+  db:
+    image: postgres:16-alpine
+    container_name: drcm_db
+    restart: always
+    environment:
+      POSTGRES_DB: chaos_campaign
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgrespassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d chaos_campaign"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Бэкенд FastAPI
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: drcm_backend
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgrespassword@db:5432/chaos_campaign
+      - SECRET_KEY=SUPER_SECRET_KEY_CHANGE_IN_PRODUCTION
+      - API_V1_STR=/api/v1
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # 3. Фронтенд React SPA
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: drcm_frontend
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:

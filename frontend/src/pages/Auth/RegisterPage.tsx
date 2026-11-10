@@ -20,7 +20,16 @@ export const RegisterPage: React.FC = () => {
       await authApi.register({ username, password });
       navigate('/login');
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Ошибка регистрации');
+      const detail = err.response?.data?.detail;
+      if (typeof detail === 'string') {
+        setError(detail);
+      } else if (Array.isArray(detail)) {
+        setError(detail.map((item: any) => item.msg || JSON.stringify(item)).join(', '));
+      } else if (detail && typeof detail === 'object') {
+        setError(JSON.stringify(detail));
+      } else {
+        setError('Ошибка регистрации');
+      }
     } finally {
       setIsLoading(false);
     }

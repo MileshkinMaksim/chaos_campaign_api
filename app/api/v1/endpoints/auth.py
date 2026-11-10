@@ -16,12 +16,6 @@ async def register_user(
     user_in: UserRegister,
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    Регистрирует нового командира отряда в базе данных.
-    
-    * **201 Created**: Пользователь успешно создан.
-    * **400 Bad Request**: Имя пользователя уже занято.
-    """
     stmt = select(UserModel).where(UserModel.username == user_in.username)
     result = await db.execute(stmt)
     if result.scalar_one_or_none() is not None:
@@ -35,7 +29,8 @@ async def register_user(
         hashed_password=get_password_hash(user_in.password)
     )
     db.add(new_user)
-    await db.flush()
+    await db.commit()
+    await db.refresh(new_user)
     return new_user
 
 

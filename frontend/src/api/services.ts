@@ -1,5 +1,6 @@
 import { apiClient } from './client';
 import * as T from '../types';
+import { Faction } from '../types';
 
 export const authApi = {
   register: (data: { username: string; password: string }) =>
@@ -25,4 +26,77 @@ export const forcesApi = {
     apiClient.delete(`/forces/${forceId}`).then(r => r.data),
   exportRecordSheet: (forceId: string) =>
     apiClient.get(`/forces/${forceId}/export`, { responseType: 'blob' }).then(r => r.data),
+};
+
+export const pilotsApi = {
+  getPilot: (id: string) =>
+    apiClient.get<T.NamedPilot>(`/pilots/${id}`).then((r) => r.data),
+  upgradePilot: (id: string, request: T.PilotUpgradeRequest) =>
+    apiClient.post<T.NamedPilot>(`/pilots/${id}/upgrade`, request).then((r) => r.data),
+};
+
+export enum CommandRights {
+  INTEGRATED = 'Integrated',
+  CO_COMMAND = 'Co-Command',
+  INDEPENDENT = 'Independent',
+}
+
+export enum SalvageRights {
+  FULL = 'Full',
+  SHARED = 'Shared',
+  EXCHANGE = 'Exchange',
+  NONE = 'None',
+}
+
+export interface ContractTerms {
+  base_payment_sp: number;
+  overhead_sp: number;
+  command_rights: CommandRights;
+  salvage_rights: SalvageRights;
+  support_rights_percent: number;
+  transport_coverage_percent: number;
+}
+
+export interface ContractResponse {
+  id: string;
+  title: string;
+  employer: Faction;
+  target_faction: Faction;
+  location_hot_spot: string;
+  required_reputation: number;
+  terms: ContractTerms;
+  is_signed: boolean;
+  is_completed: boolean;
+}
+
+export interface ContractNegotiationOffer {
+  requested_terms: ContractTerms;
+}
+
+export const contractsApi = {
+  // Получить доступные контракты
+  getAvailableContracts: async (params?: { employer?: string; location?: string }): Promise<ContractResponse[]> => {
+    const response = await apiClient.get('/contracts/available', { params });
+    return response.data;
+  },
+
+  // Провести переговоры по изменению условий
+  negotiateContract: async (contractId: string, offer: ContractNegotiationOffer): Promise<ContractResponse> => {
+    const response = await apiClient.post(`/contracts/${contractId}/negotiate`, offer);
+    return response.data;
+  },
+
+  // Подписать контракт отрядом
+  signContract: async (contractId: string, forceId: string): Promise<ContractResponse> => {
+    const response = await apiClient.post(`/contracts/${contractId}/sign`, null, {
+      params: { force_id: forceId },
+    });
+    return response.data;
+  },
+
+  // Процедурно сгенерировать новый контракт по правилам Hot Spots
+  generateContract: async (): Promise<ContractResponse> => {
+    const response = await apiClient.post('/generator/contract');
+    return response.data;
+  },
 };

@@ -14,7 +14,8 @@ import {
   UserCheck, 
   LogOut,
   ChevronRight,
-  ChevronLeft
+  ChevronLeft,
+  Sparkles
 } from 'lucide-react';
 
 export const DashboardPage: React.FC = () => {
@@ -41,35 +42,34 @@ export const DashboardPage: React.FC = () => {
 
   // Скачивание Force Record Sheet
   const handleExportSheet = async () => {
-  if (!id || !force) return;
-  try {
-    const rawData = await forcesApi.exportRecordSheet(id);
-    
-    let blob: Blob;
-    if (rawData instanceof Blob) {
-      blob = rawData;
-    } else if (rawData && (rawData as any).data instanceof Blob) {
-      blob = (rawData as any).data;
-    } else {
-      blob = new Blob([JSON.stringify(rawData)], { type: 'application/json' });
+    if (!id || !force) return;
+    try {
+      const rawData = await forcesApi.exportRecordSheet(id);
+      
+      let blob: Blob;
+      if (rawData instanceof Blob) {
+        blob = rawData;
+      } else if (rawData && (rawData as any).data instanceof Blob) {
+        blob = (rawData as any).data;
+      } else {
+        blob = new Blob([JSON.stringify(rawData)], { type: 'application/json' });
+      }
+
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `${force.name}_record_sheet.json`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+
+      setTimeout(() => {
+        window.URL.revokeObjectURL(url);
+      }, 1000);
+    } catch (err) {
+      console.error('Ошибка при экспорте Record Sheet', err);
     }
-
-    const url = window.URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `${force.name}_record_sheet.json`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-
-    // Даем браузеру время зарегистрировать событие скачивания
-    setTimeout(() => {
-      window.URL.revokeObjectURL(url);
-    }, 1000);
-  } catch (err) {
-    console.error('Ошибка при экспорте Record Sheet', err);
-  }
-};
+  };
 
   if (isLoading) {
     return (
@@ -155,11 +155,44 @@ export const DashboardPage: React.FC = () => {
 
       {/* Быстрое меню навигации по разделам */}
       <nav className="bg-slate-900/60 border-b border-bt-border px-6 py-2 flex gap-4 text-xs font-bold uppercase tracking-wider overflow-x-auto">
-        <span className="text-bt-amber border-b-2 border-bt-amber pb-1 cursor-default">Обзор отряда</span>
-        <Link to="/pilots" className="text-slate-400 hover:text-white transition-colors pb-1">Прокачка пилотов</Link>
-        <Link to="/contracts" className="text-slate-400 hover:text-white transition-colors pb-1">Контракты</Link>
-        <Link to="/tracks" className="text-slate-400 hover:text-white transition-colors pb-1">Миссии</Link>
-        <Link to="/logistics" className="text-slate-400 hover:text-white transition-colors pb-1">Логистика</Link>
+        <button
+          onClick={() => setActiveTab('mechs')}
+          className={`pb-1 transition-colors border-b-2 ${
+            activeTab === 'mechs'
+              ? 'text-bt-amber border-bt-amber'
+              : 'text-slate-400 hover:text-white border-transparent'
+          }`}
+        >
+          Обзор отряда
+        </button>
+        <button
+          onClick={() => setActiveTab('pilots')}
+          className={`pb-1 transition-colors border-b-2 ${
+            activeTab === 'pilots'
+              ? 'text-bt-amber border-bt-amber'
+              : 'text-slate-400 hover:text-white border-transparent'
+          }`}
+        >
+          Прокачка пилотов
+        </button>
+        <button
+          onClick={() => alert("Раздел 'Контракты' появится на Шаге 6")}
+          className="text-slate-500 hover:text-slate-400 transition-colors pb-1 border-b-2 border-transparent"
+        >
+          Контракты
+        </button>
+        <button
+          onClick={() => alert("Раздел 'Миссии' появится на Шаге 7")}
+          className="text-slate-500 hover:text-slate-400 transition-colors pb-1 border-b-2 border-transparent"
+        >
+          Миссии
+        </button>
+        <button
+          onClick={() => alert("Раздел 'Логистика' появится на Шаге 8")}
+          className="text-slate-500 hover:text-slate-400 transition-colors pb-1 border-b-2 border-transparent"
+        >
+          Логистика
+        </button>
       </nav>
 
       {/* Основной контент Дашборда */}
@@ -263,43 +296,68 @@ export const DashboardPage: React.FC = () => {
               return (
                 <div
                   key={pilot.id}
-                  className="bg-bt-card border border-bt-border rounded-lg p-5 shadow-lg space-y-4"
+                  className="bg-bt-card border border-bt-border rounded-lg p-5 shadow-lg space-y-4 flex flex-col justify-between"
                 >
-                  <div className="flex justify-between items-start">
-                    <div>
-                      <h3 className="font-bold text-white text-lg">{pilot.name}</h3>
-                      <p className="text-xs text-slate-400">
-                        Прикрепленный мех:{' '}
-                        {assignedUnit ? (
-                          <span className="text-bt-amber font-medium">
-                            {assignedUnit.chassis} {assignedUnit.model}
-                          </span>
-                        ) : (
-                          <span className="text-slate-500 italic">Не назначен</span>
-                        )}
-                      </p>
+                  <div className="space-y-4">
+                    <div className="flex justify-between items-start">
+                      <div>
+                        <h3 className="font-bold text-white text-lg">{pilot.name}</h3>
+                        <p className="text-xs text-slate-400">
+                          Прикрепленный мех:{' '}
+                          {assignedUnit ? (
+                            <span className="text-bt-amber font-medium">
+                              {assignedUnit.chassis} {assignedUnit.model}
+                            </span>
+                          ) : (
+                            <span className="text-slate-500 italic">Не назначен</span>
+                          )}
+                        </p>
+                      </div>
+                      <span className="bg-bt-amber/20 border border-bt-amber/40 text-bt-amber font-mono font-bold text-xs px-2.5 py-1 rounded">
+                        {pilot.experience_points} XP
+                      </span>
                     </div>
-                    <span className="bg-bt-amber/20 border border-bt-amber/40 text-bt-amber font-mono font-bold text-xs px-2.5 py-1 rounded">
-                      {pilot.experience_points} XP
-                    </span>
+
+                    <div className="grid grid-cols-3 gap-2 bg-slate-900/80 p-3 rounded text-center border border-bt-border/50">
+                      <div>
+                        <span className="text-slate-500 block text-[10px] uppercase font-bold">Gunnery</span>
+                        <span className="text-base font-bold text-white">{pilot.gunnery}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[10px] uppercase font-bold">Piloting</span>
+                        <span className="text-base font-bold text-white">{pilot.piloting}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[10px] uppercase font-bold">Edge</span>
+                        <span className="text-base font-bold text-bt-amber">{pilot.edge_points}</span>
+                      </div>
+                    </div>
+
+                    {/* Секция специальных способностей (SPA) */}
+                    <div className="bg-slate-900/40 p-2.5 rounded border border-bt-border/40 space-y-1">
+                      <div className="flex items-center gap-1.5 text-[10px] font-bold uppercase text-slate-400">
+                        <Sparkles className="w-3.5 h-3.5 text-bt-amber" /> Изученные SPA ({pilot.special_abilities?.length || 0}/5):
+                      </div>
+                      {pilot.special_abilities && pilot.special_abilities.length > 0 ? (
+                        <div className="flex flex-wrap gap-1.5 pt-1">
+                          {pilot.special_abilities.map((ability, idx) => (
+                            <span
+                              key={idx}
+                              className="inline-block bg-slate-900 border border-bt-amber/30 text-bt-amber font-mono text-[11px] font-medium px-2 py-0.5 rounded"
+                            >
+                              {ability}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <span className="text-xs text-slate-500 italic block pt-0.5">
+                          Специальные способности отсутствуют
+                        </span>
+                      )}
+                    </div>
                   </div>
 
-                  <div className="grid grid-cols-3 gap-2 bg-slate-900/80 p-3 rounded text-center border border-bt-border/50">
-                    <div>
-                      <span className="text-slate-500 block text-[10px] uppercase font-bold">Gunnery</span>
-                      <span className="text-base font-bold text-white">{pilot.gunnery}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 block text-[10px] uppercase font-bold">Piloting</span>
-                      <span className="text-base font-bold text-white">{pilot.piloting}</span>
-                    </div>
-                    <div>
-                      <span className="text-slate-500 block text-[10px] uppercase font-bold">Edge</span>
-                      <span className="text-base font-bold text-bt-amber">{pilot.edge_points}</span>
-                    </div>
-                  </div>
-
-                  <div className="flex justify-between items-center pt-2">
+                  <div className="flex justify-between items-center pt-2 border-t border-bt-border/40">
                     <span className="text-xs text-slate-400">
                       Всего заработано XP: <span className="font-mono text-slate-200">{pilot.total_xp_earned}</span>
                     </span>

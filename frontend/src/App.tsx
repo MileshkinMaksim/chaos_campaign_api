@@ -7,6 +7,7 @@ import { RegisterPage } from './pages/Auth/RegisterPage';
 import { ForceCreationPage } from './pages/ForceWizard/ForceCreationPage';
 import { DashboardPage } from './pages/Dashboard/DashboardPage';
 import { ForceSelectionPage } from './pages/ForceSelection/ForceSelectionPage';
+import { PilotProgressionPage } from './pages/Pilot/PilotProgressionPage';
 
 const queryClient = new QueryClient();
 
@@ -23,6 +24,7 @@ export const App: React.FC = () => {
             <Route path="/" element={<ForceSelectionPage />} />
             <Route path="/forces/create" element={<ForceCreationPage />} />
             <Route path="/forces/:id" element={<DashboardPage />} />
+            <Route path="/pilots/:id" element={<PilotProgressionPage />} />
           </Route>
 
           <Route path="*" element={<Navigate to="/" replace />} />

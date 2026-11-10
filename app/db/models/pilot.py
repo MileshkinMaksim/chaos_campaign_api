@@ -1,6 +1,6 @@
 import uuid
-from typing import Optional
-from sqlalchemy import String, Integer, Boolean, ForeignKey
+from typing import List, Optional
+from sqlalchemy import String, Integer, Boolean, ForeignKey, JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.database import Base
 
@@ -19,6 +19,8 @@ class PilotModel(Base):
     total_xp_earned: Mapped[int] = mapped_column(Integer, default=150)
     
     edge_points: Mapped[int] = mapped_column(Integer, default=1)
+    special_abilities: Mapped[List[str]] = mapped_column(JSON, default=list, nullable=False)
+
     is_temporary_hire: Mapped[bool] = mapped_column(Boolean, default=False)
 
     force: Mapped[Optional["ForceModel"]] = relationship("ForceModel", back_populates="pilots")
