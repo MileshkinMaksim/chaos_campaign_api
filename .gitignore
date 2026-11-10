@@ -40,5 +40,5 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-repomix-output.md
-repomix-output.xml
+repomix*
+repomix-output.*
