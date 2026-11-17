@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ProtectedRoute } from './components/common/ProtectedRoute';
@@ -8,10 +8,17 @@ import { ForceCreationPage } from './pages/ForceWizard/ForceCreationPage';
 import { DashboardPage } from './pages/Dashboard/DashboardPage';
 import { ForceSelectionPage } from './pages/ForceSelection/ForceSelectionPage';
 import { PilotProgressionPage } from './pages/Pilot/PilotProgressionPage';
-
+// import { ContractsPage } from './pages/Contracts/ContractsPage';
+import { useAuthStore } from './store/authStore';
 const queryClient = new QueryClient();
 
 export const App: React.FC = () => {
+  const checkAuth = useAuthStore((state) => state.checkAuth);
+
+  useEffect(() => {
+    checkAuth();
+  }, [checkAuth]);
+  
   return (
     <QueryClientProvider client={queryClient}>
       <BrowserRouter>

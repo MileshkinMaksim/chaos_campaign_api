@@ -86,7 +86,14 @@ export const ForceCreationPage: React.FC = () => {
       });
       navigate(`/forces/${newForce.id}`);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Не удалось сформировать отряд');
+      const detail = err.response?.data?.detail;
+      if (Array.isArray(detail)) {
+        setError(detail.map((item: any) => item.msg).join('; '));
+      } else if (typeof detail === 'string') {
+        setError(detail);
+      } else {
+        setError('Не удалось сформировать отряд');
+      }
     } finally {
       setIsSubmitting(false);
     }

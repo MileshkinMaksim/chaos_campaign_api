@@ -1,14 +1,19 @@
 import { apiClient } from './client';
 import * as T from '../types';
 import { Faction } from '../types';
+import type { User } from '../types/auth';
 
 export const authApi = {
   register: (data: { username: string; password: string }) =>
-    apiClient.post<{ id: string; username: string }>('/auth/register', data),
+    apiClient.post<User>('/auth/register', data),
   login: (formData: FormData) =>
-    apiClient.post<{ access_token: string; token_type: string }>('/auth/token', formData, {
+    apiClient.post<User>('/auth/token', formData, {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     }),
+  me: () =>
+    apiClient.get<User>('/auth/me').then((r) => r.data),
+  logout: () =>
+    apiClient.post('/auth/logout'),
 };
 
 export const forcesApi = {

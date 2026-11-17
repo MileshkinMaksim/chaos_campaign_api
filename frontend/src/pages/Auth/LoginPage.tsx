@@ -10,7 +10,7 @@ export const LoginPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
 
-  const setToken = useAuthStore((state) => state.setToken);
+  const setUser = useAuthStore((state) => state.setUser);
   const navigate = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -24,7 +24,7 @@ export const LoginPage: React.FC = () => {
       formData.append('password', password);
 
       const res = await authApi.login(formData);
-      setToken(res.data.access_token);
+      setUser(res.data);
       navigate('/');
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Ошибка авторизации');

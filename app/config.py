@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
 
+    COOKIE_NAME: str = "drcm_access_token"
+    COOKIE_SECURE: bool = False  # Установить True потом
+    COOKIE_SAMESITE: str = "lax"
+
     DATABASE_URL: str = "sqlite+aiosqlite:///./chaos_campaign.db"
     RAT_JSON_PATH: str = "app/db/data/factions_rat.json"
 

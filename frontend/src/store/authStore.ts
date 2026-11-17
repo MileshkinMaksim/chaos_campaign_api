@@ -1,26 +1,50 @@
 import { create } from 'zustand';
+import { authApi } from '../api/services';
+import type { User } from '../types/auth';
 
 interface AuthState {
-  token: string | null;
+  user: User | null;
   isAuthenticated: boolean;
-  setToken: (token: string | null) => void;
-  logout: () => void;
+  isLoading: boolean;
+  setUser: (user: User | null) => void;
+  checkAuth: () => Promise<void>;
+  clearAuth: () => void;
+  logout: () => Promise<void>;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
-  token: localStorage.getItem('token'),
-  isAuthenticated: !!localStorage.getItem('token'),
-  setToken: (token) => {
-    if (token) {
-      localStorage.setItem('token', token);
-      set({ token, isAuthenticated: true });
-    } else {
-      localStorage.removeItem('token');
-      set({ token: null, isAuthenticated: false });
+  user: null,
+  isAuthenticated: false,
+  isLoading: true,
+
+  setUser: (user) =>
+    set({
+      user,
+      isAuthenticated: !!user,
+      isLoading: false,
+    }),
+
+  checkAuth: async () => {
+    try {
+      const user = await authApi.me();
+      set({ user, isAuthenticated: true, isLoading: false });
+    } catch {
+      set({ user: null, isAuthenticated: false, isLoading: false });
     }
   },
-  logout: () => {
-    localStorage.removeItem('token');
-    set({ token: null, isAuthenticated: false });
+
+  clearAuth: () =>
+    set({
+      user: null,
+      isAuthenticated: false,
+      isLoading: false,
+    }),
+
+  logout: async () => {
+    try {
+      await authApi.logout();
+    } finally {
+      set({ user: null, isAuthenticated: false, isLoading: false });
+    }
   },
 }));
